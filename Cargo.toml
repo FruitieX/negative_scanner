@@ -11,3 +11,4 @@ debug = 0
 
 [dependencies]
 opencv = "0.53"
+serialport = "4.0.1"

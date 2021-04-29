@@ -3,20 +3,6 @@ import numpy as np
 import serial
 from matplotlib import pyplot as plt
 
-# template = cv.imread('template.png')
-# template = cv.cvtColor(template, cv.COLOR_RGBA2RGB)
-# mask = cv.imread('mask.png')
-# mask = cv.cvtColor(mask, cv.COLOR_RGBA2RGB)
-# img_gray = cv.cvtColor(img_rgb, cv.COLOR_BGR2GRAY)
-# template = cv.imread('mario_coin.png',0)
-# w, h = template.shape[::-1]
-
-# res = cv.matchTemplate(img_gray,template,cv.TM_CCOEFF_NORMED)
-# threshold = 0.8
-# loc = np.where( res >= threshold)
-# for pt in zip(*loc[::-1]):
-#     cv.rectangle(img_rgb, pt, (pt[0] + w, pt[1] + h), (0,0,255), 2)
-
 print("opening serial port...")
 ser = serial.Serial('COM3', 19200)
 
@@ -35,6 +21,23 @@ cv.createTrackbar('B', 'controls', 255, 512, nothing)
 cv.createTrackbar('C', 'controls', 5, 20, nothing)
 cv.createTrackbar('C2', 'controls', 2, 20, nothing)
 cv.createTrackbar('D', 'controls', 7, 11, nothing)
+
+
+def filter_large_contours(contour):
+    area = cv.contourArea(contour)
+    return area > 100000
+
+
+def sort_by_contour_centroid(contour):
+    M = cv.moments(contour)
+    cx = int(M['m10']/M['m00'])
+    cx
+
+
+MANUAL_MODE = True
+
+searching_frame = True
+waiting_for_shutter = False
 
 while(True):
     # Capture frame-by-frame
@@ -68,60 +71,46 @@ while(True):
 
     # img_canny = cv.Canny(img_mop, 1, 3)
 
-    # Our operations on the frame come here
-    # img = cv.cvtColor(frame, cv.COLOR_RGB2RGBA)
-    # img = cv.bitwise_not(frame).copy()
+    img_mop = cv.bitwise_not(img_mop)
 
-    # img = cv.imread('out.png')
-    # img_display = img.copy()
+    contours, hierarchy = cv.findContours(
+        img_mop, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
 
-    # img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    # img = cv.medianBlur(img, 5)
+    contours = list(filter(filter_large_contours, contours))
+    contours.sort(key=sort_by_contour_centroid)
 
-    # img = cv.adaptiveThreshold(
-    #     img, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 11, 2)
-    # img = cv.cvtColor(img, cv.COLOR_GRAY2RGB)
+    cv.drawContours(img, contours, -1, (0, 255, 0), 3)
 
-    # print(img, template, mask)
-    # result = cv.matchTemplate(img, template, cv.TM_CCORR_NORMED, None, mask)
-
-    # cv.normalize(result, result, 0, 1, cv.NORM_MINMAX, -1)
-    # _minVal, _maxVal, minLoc, maxLoc = cv.minMaxLoc(result, None)
-
-    # matchLoc = maxLoc
-
-    # print(matchLoc)
-    # print(_minVal, _maxVal)
-
-    # # Display the resulting frame
-    # if (abs(_minVal) < 1e-07):
-    #     cv.rectangle(img_display, matchLoc,
-    #                  (matchLoc[0] + template.shape[0], matchLoc[1] + template.shape[1]), (0, 0, 0), 2, 8, 0)
-    #     cv.rectangle(result, matchLoc, (matchLoc[0] + template.shape[0],
-    #                                     matchLoc[1] + template.shape[1]), (0, 0, 0), 2, 8, 0)
-
-    # cv.imshow('img_display', img_display)
     cv.imshow('frame', frame)
     cv.imshow('img', img)
     cv.imshow('img_thr', img_thr)
     cv.imshow('img_mop', img_mop)
-    # cv.imshow('img_canny', img_canny)
-    # cv.imshow('result', result)
 
     key = cv.waitKey(1)
 
     if key == ord('q'):
         break
 
-    # move film forward
-    if key == ord('e'):
-        ser.write(b'LLLLLLLLLLLLLLLLLLLLLLLL')
-    # move film back
-    if key == ord('a'):
-        ser.write(b'RRRRRRRRRRRRRRRRRRRRRRRR')
-    # shutter
-    if key == ord('s'):
-        ser.write(b'S')
+    if MANUAL_MODE:
+        # move film forward
+        if key == ord('e'):
+            ser.write(b'LLLLLLLLLLLLLLLLLLLLLLLL')
+        # move film back
+        if key == ord('a'):
+            ser.write(b'RRRRRRRRRRRRRRRRRRRRRRRR')
+        # shutter
+        if key == ord('s'):
+            ser.write(b'S')
+
+    else:
+        if contours:
+            last = contours[-1]
+            M = cv.moments(last)
+            cx = int(M['m10']/M['m00'])
+            print("last contour centroid:")
+            print(cx)
+        else:
+            ser.write(b'RRRRRRRRRRRRRRRRRRRRRRRR')
 
 # When everything done, release the capture
 cap.release()
