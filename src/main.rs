@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use opencv::{
     core::{self, Moments, Point, Scalar},
@@ -7,23 +7,35 @@ use opencv::{
     types::VectorOfMat,
     videoio, Result,
 };
+use serialport::SerialPort;
 
 const CONTROLS_WINDOW: &str = "controls";
-const MANUAL_MODE: bool = true;
-const CENTROID_CENTERED: f64 = 272.0;
+const MANUAL_MODE: bool = false;
+const CENTROID_CENTERED: f64 = 300.0;
 const CENTROID_MISSED: f64 = 230.0;
 
 struct State {
-    searching_frame: bool,
-    waiting_for_shutter: bool,
+    current: ScannerState,
+}
+
+#[derive(Debug)]
+enum ScannerState {
+    SearchingFrame,
+    WaitingForShutterOpen { init_timestamp: SystemTime },
+    SkipToNextFrame { init_timestamp: SystemTime },
 }
 
 impl State {
     pub fn new() -> State {
+        println!("Searching for frames...");
         State {
-            searching_frame: true,
-            waiting_for_shutter: false,
+            current: ScannerState::SearchingFrame,
         }
+    }
+
+    pub fn set(&mut self, new: ScannerState) {
+        println!("Entering state: {:?}", new);
+        self.current = new;
     }
 }
 
@@ -34,11 +46,43 @@ struct ContourWithMoments {
     area: f64,
 }
 
+struct Scanner {
+    port: Box<dyn SerialPort>,
+}
+
+impl Scanner {
+    pub fn new(port: Box<dyn SerialPort>) -> Scanner {
+        Scanner { port }
+    }
+
+    pub fn move_forward(&mut self, steps: usize) {
+        self.port
+            .write_all("R".repeat(steps).as_bytes())
+            .expect("Writing to serial port failed");
+    }
+
+    pub fn move_back(&mut self, steps: usize) {
+        self.port
+            .write_all("L".repeat(steps).as_bytes())
+            .expect("Writing to serial port failed");
+    }
+
+    pub fn take_photo(&mut self) {
+        self.port
+            .write_all("S".as_bytes())
+            .expect("Writing to serial port failed");
+    }
+}
+
 fn main() -> Result<()> {
-    let mut port = serialport::new("COM3", 19_200)
+    let port_infos = serialport::available_ports().expect("No serial ports found");
+    let port_info = port_infos.first().expect("No serial ports found");
+    let port = serialport::new(port_info.port_name.clone(), 19_200)
         .timeout(Duration::from_secs(1))
         .open()
         .expect("Failed to open serial port");
+
+    let mut scanner = Scanner::new(port);
 
     let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?; // 0 is the default camera
 
@@ -57,7 +101,7 @@ fn main() -> Result<()> {
     highgui::named_window(CONTROLS_WINDOW, 1)?;
 
     highgui::create_trackbar("x", CONTROLS_WINDOW, &mut 52, frame_width - 1, None)?;
-    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 22, frame_height - 1, None)?;
+    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 24, frame_height - 1, None)?;
     highgui::create_trackbar(
         "width",
         CONTROLS_WINDOW,
@@ -68,7 +112,7 @@ fn main() -> Result<()> {
     highgui::create_trackbar(
         "height",
         CONTROLS_WINDOW,
-        &mut (frame_height - 22 - 28),
+        &mut (frame_height - 22 - 36),
         frame_height,
         None,
     )?;
@@ -178,55 +222,89 @@ fn main() -> Result<()> {
             break;
         }
 
+        let mut cwms: Vec<ContourWithMoments> = contours
+            .iter()
+            .map(|contour| {
+                let moments = imgproc::moments(&contour, false).expect("Calling moments failed");
+                let centroid = moments.m10 / moments.m00;
+                let area = imgproc::contour_area(&contour, false).unwrap();
+
+                ContourWithMoments {
+                    contour,
+                    moments,
+                    centroid,
+                    area,
+                }
+            })
+            .filter(|moments| moments.area > 100_000.0)
+            .collect();
+
+        cwms.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
+        let last_cwm = cwms.iter().last();
+
         if MANUAL_MODE {
             // Move film forward
             if key == 'e' {
-                port.write_all("LLLLLLLLLLLLLLLLLLLLLLLL".as_bytes())
-                    .expect("Writing to serial port failed");
+                scanner.move_forward(24);
             }
 
             // Move film back
             if key == 'a' {
-                port.write_all("RRRRRRRRRRRRRRRRRRRRRRRR".as_bytes())
-                    .expect("Writing to serial port failed");
+                scanner.move_back(24);
             }
 
             // Shutter
             if key == 's' {
-                port.write_all("S".as_bytes())
-                    .expect("Writing to serial port failed");
+                scanner.take_photo();
             }
-        } /* else */
-        {
-            let mut moments: Vec<ContourWithMoments> = contours
-                .iter()
-                .map(|contour| {
-                    let moments =
-                        imgproc::moments(&contour, false).expect("Calling moments failed");
-                    let centroid = moments.m10 / moments.m00;
-                    let area = imgproc::contour_area(&contour, false).unwrap();
+        } else {
+            match state.current {
+                ScannerState::SearchingFrame => {
+                    if let Some(last) = last_cwm {
+                        println!("Frame center detected at: {}", last.centroid);
 
-                    ContourWithMoments {
-                        contour,
-                        moments,
-                        centroid,
-                        area,
+                        if last.centroid < CENTROID_MISSED {
+                            println!("Frame moved too far");
+                            scanner.move_back(24);
+                        } else if last.centroid < CENTROID_CENTERED {
+                            println!("Frame in position");
+                            scanner.take_photo();
+
+                            state.set(ScannerState::WaitingForShutterOpen {
+                                init_timestamp: SystemTime::now(),
+                            });
+                        } else {
+                            println!("Stepping frame toward center");
+                            scanner.move_forward(4);
+                        }
+                    } else {
+                        scanner.move_forward(20);
                     }
-                })
-                .filter(|moments| moments.area > 100_000.0)
-                .collect();
+                }
+                ScannerState::WaitingForShutterOpen { init_timestamp } => {
+                    // Wait until enough time has passed so that we can see the camera shutter black-out
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
+                        continue;
+                    }
 
-            moments.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
+                    // Crude detection of when shutter black-out ends - if last_cwm is some we are seeing a frame again
+                    if last_cwm.is_some() {
+                        // Move forward enough so that we start detecting the next frame
+                        scanner.move_forward(850);
 
-            let last = moments.iter().last();
+                        state.set(ScannerState::SkipToNextFrame {
+                            init_timestamp: SystemTime::now(),
+                        });
+                    }
+                }
 
-            if let Some(last) = last {
-                println!("Last contour centroid: {}", last.centroid);
+                ScannerState::SkipToNextFrame { init_timestamp } => {
+                    // Wait until enough time has passed so that the film has moved far enough
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
+                        continue;
+                    }
 
-                if last.centroid < CENTROID_MISSED {
-                    println!("Last centroid too far!");
-                } else if last.centroid < CENTROID_CENTERED {
-                    println!("Last centroid past center point!");
+                    state.set(ScannerState::SearchingFrame);
                 }
             }
         }
