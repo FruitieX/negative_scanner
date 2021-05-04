@@ -50,29 +50,30 @@ void loop() {
     if (incoming_byte == 'M') {
       int steps = serial_buffer.toInt();
       serial_buffer = "";
-      stepper.move(steps); // 1300 ~= one frame
+
+      if (steps == 0) {
+        stepper.stop();
+      } else {
+        stepper.move(steps);
+      }
     }
     else if (incoming_byte == 'S') {
-      stepper.stop();
-    }
-    else if (incoming_byte == 's') {
       // Force motor to stop to avoid vibrations
-      digitalWrite(SLP_PIN, LOW);
+      //digitalWrite(SLP_PIN, LOW);
       
       // Shutter
-      digitalWrite(FOCUS_PIN, HIGH);
-      delay(50);
+      //digitalWrite(FOCUS_PIN, HIGH);
+      //delay(50);
       digitalWrite(SHUTTER_PIN, HIGH);
       delay(50);
       digitalWrite(SHUTTER_PIN, LOW);
-      digitalWrite(FOCUS_PIN, LOW);
+      //digitalWrite(FOCUS_PIN, LOW);
 
-      digitalWrite(FOCUS_PIN, HIGH);
+      //digitalWrite(FOCUS_PIN, HIGH);
     }
-    else if (incoming_byte == 'f') {
-      // Focus
+    else if (incoming_byte == 'F') {
       digitalWrite(FOCUS_PIN, HIGH);
-      delay(50);
+    } else if (incoming_byte == 'f') {
       digitalWrite(FOCUS_PIN, LOW);
     }
     else if (incoming_byte == '\n') {

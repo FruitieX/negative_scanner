@@ -25,6 +25,7 @@ enum ScannerState {
     SearchingFrame,
     FoundFrame {
         init_timestamp: SystemTime,
+        wait_time: f64,
         consecutive_missed_frames: usize,
     },
     WaitingForShutterOpen {
@@ -44,7 +45,7 @@ impl State {
     }
 
     pub fn set(&mut self, new: ScannerState) {
-        println!("Entering state: {:?}", new);
+        // println!("Entering state: {:?}", new);
         self.current = new;
     }
 }
@@ -65,8 +66,10 @@ impl Scanner {
         Scanner { port }
     }
 
-    pub fn move_forward(&mut self, steps: usize) {
-        println!("Moving forward {} steps", steps);
+    pub fn move_forward(&mut self, steps: usize, silent: bool) {
+        if !silent {
+            println!("Moving forward {} steps", steps);
+        }
 
         // 1300 ~= one frame
         self.write(&format!("{}M", steps));
@@ -78,19 +81,25 @@ impl Scanner {
         self.write(&format!("-{}M", steps));
     }
 
-    pub fn stop(&mut self) {
-        println!("Immediately stopping motor");
+    pub fn stop(&mut self, silent: bool) {
+        if !silent {
+            println!("Immediately stopping motor");
+        }
 
-        self.write("S");
+        self.write("0M");
     }
 
     pub fn take_photo(&mut self) {
         println!("Taking photo");
 
-        // self.write("s");
+        self.write("S");
     }
 
     pub fn focus(&mut self) {
+        self.write("F");
+    }
+
+    pub fn stop_focus(&mut self) {
         self.write("f");
     }
 
@@ -114,9 +123,17 @@ fn main() -> Result<()> {
         .expect("Failed to open serial port");
 
     let mut pause = true;
+    println!("Starting in paused/manual mode. Hit spacebar to start automation.");
+    println!("Manual mode controls:");
+    println!("r = Reset to initial state");
+    println!("q = Quit");
+    println!("e = Move film forward");
+    println!("a = Move film back");
+    println!("s = Shutter");
+    println!("f = Focus");
+    println!("u = Stop focus");
 
     let mut scanner = Scanner::new(port);
-    scanner.focus();
 
     let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?; // 0 is the default camera
 
@@ -327,19 +344,19 @@ fn main() -> Result<()> {
                 1,
                 8,
             )?;
-            if last.centroid < missed {
-                println!("Frame {}px too far left", missed - last.centroid);
-            } else if last.centroid <= center + CENTER_TOLERANCE {
-                println!("Frame in position (Δ{}px)", last.centroid - center);
-            } else {
-                println!("Frame {}px too far right", last.centroid - in_position)
-            }
+            // if last.centroid < missed {
+            //     println!("Frame {}px too far left", missed - last.centroid);
+            // } else if last.centroid <= center + CENTER_TOLERANCE {
+            //     println!("Frame in position (Δ{}px)", last.centroid - center);
+            // } else {
+            //     println!("Frame {}px too far right", last.centroid - in_position)
+            // }
         }
         highgui::imshow("frame", &frame)?;
 
         // Move film forward
         if key == 'e' {
-            scanner.move_forward(80);
+            scanner.move_forward(80, false);
         }
 
         // Move film back
@@ -357,33 +374,50 @@ fn main() -> Result<()> {
             scanner.focus();
         }
 
+        // Stop focus
+        if key == 'u' {
+            scanner.stop_focus();
+        }
+
+        // Reset
+        if key == 'r' {
+            state.set(ScannerState::SearchingFrame);
+        }
+
         if key == ' ' {
             pause = !pause;
+            if pause {
+                println!("Paused. Hit spacebar to unpause.");
+            } else {
+                println!("Unpaused. Hit spacebar to pause.");
+            }
         }
 
         if pause {
-            scanner.stop();
+            scanner.stop(true);
         } else if !MANUAL_MODE {
             match state.current {
                 ScannerState::SearchingFrame => {
                     if last_cwm.is_some() {
                         // Found a frame, pause for a second to analyze exact distance
-                        scanner.stop();
+                        scanner.stop(false);
                         state.set(ScannerState::FoundFrame {
                             init_timestamp: SystemTime::now(),
                             consecutive_missed_frames: 0,
+                            // Wait until enough time has passed so that the film has stopped moving (camera feed input lag)
+                            wait_time: 0.5,
                         })
                     } else {
                         // Move motor at full speed until we find something
-                        scanner.move_forward(700);
+                        scanner.move_forward(500, true);
                     }
                 }
                 ScannerState::FoundFrame {
                     init_timestamp,
                     consecutive_missed_frames,
+                    wait_time,
                 } => {
-                    // Wait until enough time has passed so that the film has stopped moving (camera feed input lag)
-                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 0.5 {
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < wait_time {
                         continue;
                     }
 
@@ -391,13 +425,20 @@ fn main() -> Result<()> {
                         state.set(ScannerState::FoundFrame {
                             init_timestamp,
                             consecutive_missed_frames: 0,
+                            wait_time,
                         });
 
                         if last.centroid < missed {
                             println!("Frame moved too far, skipping to next");
-                            scanner.move_forward(500);
+                            scanner.move_forward(500, false);
                         } else if last.centroid <= center + CENTER_TOLERANCE {
+                            scanner.focus();
+                            println!(
+                                "Taking picture with frame position Δ{}px",
+                                last.centroid - center
+                            );
                             scanner.take_photo();
+                            scanner.stop_focus();
 
                             state.set(ScannerState::WaitingForShutterOpen {
                                 init_timestamp: SystemTime::now(),
@@ -408,9 +449,11 @@ fn main() -> Result<()> {
                             println!("Distance to center: {}", dist_px);
                             let steps = dist_px * PX_PER_STEP;
                             let steps = steps.round().max(5.0);
-                            scanner.move_forward(steps as usize);
-                            state.set(ScannerState::SkipToNextFrame {
+                            scanner.move_forward(steps as usize, false);
+                            state.set(ScannerState::FoundFrame {
                                 init_timestamp: SystemTime::now(),
+                                consecutive_missed_frames: 0,
+                                wait_time: 1.0, // TODO: variable wait time based on number of steps
                             });
                         }
                     } else if consecutive_missed_frames > 5 {
@@ -420,11 +463,11 @@ fn main() -> Result<()> {
                         state.set(ScannerState::FoundFrame {
                             init_timestamp,
                             consecutive_missed_frames: consecutive_missed_frames + 1,
+                            wait_time,
                         });
                     }
                 }
                 ScannerState::WaitingForShutterOpen { init_timestamp } => {
-                    highgui::imshow("frame", &frame)?;
                     // Wait until enough time has passed so that we can see the camera shutter black-out
                     if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
                         continue;
@@ -433,7 +476,7 @@ fn main() -> Result<()> {
                     // Crude detection of when shutter black-out ends - if last_cwm is some we are seeing a frame again
                     if last_cwm.is_some() {
                         // Move enough forward so that we start detecting the next frame
-                        scanner.move_forward(1000);
+                        scanner.move_forward(1000, false);
 
                         state.set(ScannerState::SkipToNextFrame {
                             init_timestamp: SystemTime::now(),
@@ -442,7 +485,6 @@ fn main() -> Result<()> {
                 }
 
                 ScannerState::SkipToNextFrame { init_timestamp } => {
-                    highgui::imshow("frame", &frame)?;
                     // scanner.focus();
                     // Wait until enough time has passed so that the film has moved far enough
                     if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
