@@ -11,8 +11,10 @@ use serialport::SerialPort;
 
 const CONTROLS_WINDOW: &str = "controls";
 const MANUAL_MODE: bool = false;
-const CENTROID_CENTERED: f64 = 300.0;
-const CENTROID_MISSED: f64 = 230.0;
+const CENTER_TOLERANCE: f64 = 20.0;
+const CENTER_TOLERANCE_MISSED: f64 = 20.0;
+const PX_PER_STEP: f64 = 5.0;
+const MOP_RECT_HEIGHT_PCT: f64 = 0.2;
 
 struct State {
     current: ScannerState,
@@ -21,8 +23,16 @@ struct State {
 #[derive(Debug)]
 enum ScannerState {
     SearchingFrame,
-    WaitingForShutterOpen { init_timestamp: SystemTime },
-    SkipToNextFrame { init_timestamp: SystemTime },
+    FoundFrame {
+        init_timestamp: SystemTime,
+        consecutive_missed_frames: usize,
+    },
+    WaitingForShutterOpen {
+        init_timestamp: SystemTime,
+    },
+    SkipToNextFrame {
+        init_timestamp: SystemTime,
+    },
 }
 
 impl State {
@@ -56,20 +66,41 @@ impl Scanner {
     }
 
     pub fn move_forward(&mut self, steps: usize) {
-        self.port
-            .write_all("R".repeat(steps).as_bytes())
-            .expect("Writing to serial port failed");
+        println!("Moving forward {} steps", steps);
+
+        // 1300 ~= one frame
+        self.write(&format!("{}M", steps));
     }
 
     pub fn move_back(&mut self, steps: usize) {
-        self.port
-            .write_all("L".repeat(steps).as_bytes())
-            .expect("Writing to serial port failed");
+        println!("Moving back {} steps", steps);
+
+        self.write(&format!("-{}M", steps));
+    }
+
+    pub fn stop(&mut self) {
+        println!("Immediately stopping motor");
+
+        self.write("S");
     }
 
     pub fn take_photo(&mut self) {
+        println!("Taking photo");
+
+        // self.write("s");
+    }
+
+    pub fn focus(&mut self) {
+        self.write("f");
+    }
+
+    fn write(&mut self, buf: &str) {
+        // println!("Writing to serial: {}", buf);
+
+        let bytes = buf.as_bytes();
+        // println!("Bytes: {:?}", bytes);
         self.port
-            .write_all("S".as_bytes())
+            .write_all(bytes)
             .expect("Writing to serial port failed");
     }
 }
@@ -77,12 +108,15 @@ impl Scanner {
 fn main() -> Result<()> {
     let port_infos = serialport::available_ports().expect("No serial ports found");
     let port_info = port_infos.first().expect("No serial ports found");
-    let port = serialport::new(port_info.port_name.clone(), 19_200)
+    let port = serialport::new(port_info.port_name.clone(), 115_200)
         .timeout(Duration::from_secs(1))
         .open()
         .expect("Failed to open serial port");
 
+    let mut pause = true;
+
     let mut scanner = Scanner::new(port);
+    scanner.focus();
 
     let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?; // 0 is the default camera
 
@@ -101,7 +135,7 @@ fn main() -> Result<()> {
     highgui::named_window(CONTROLS_WINDOW, 1)?;
 
     highgui::create_trackbar("x", CONTROLS_WINDOW, &mut 52, frame_width - 1, None)?;
-    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 24, frame_height - 1, None)?;
+    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 26, frame_height - 1, None)?;
     highgui::create_trackbar(
         "width",
         CONTROLS_WINDOW,
@@ -112,7 +146,7 @@ fn main() -> Result<()> {
     highgui::create_trackbar(
         "height",
         CONTROLS_WINDOW,
-        &mut (frame_height - 22 - 36),
+        &mut (frame_height - 22 - 26),
         frame_height,
         None,
     )?;
@@ -141,7 +175,7 @@ fn main() -> Result<()> {
         imgproc::cvt_color(&frame_cropped, &mut frame_bw, imgproc::COLOR_RGB2GRAY, 0)?;
 
         let mut frame_blurred = Mat::default();
-        imgproc::median_blur(&frame_bw, &mut frame_blurred, 4 * 2 + 1)?;
+        imgproc::median_blur(&frame_bw, &mut frame_blurred, 7 * 2 + 1)?;
 
         let mut frame_thr = Mat::default();
         imgproc::adaptive_threshold(
@@ -181,6 +215,18 @@ fn main() -> Result<()> {
             &core::no_array()?,
         )?;
 
+        let frame_mop_blurred_inv = {
+            let height = frame_mop_blurred_inv.rows() as f64 * MOP_RECT_HEIGHT_PCT;
+            let mop_rect = core::Rect::new(
+                0,
+                ((frame_mop_blurred_inv.rows() as f64) / 2.0 - height / 2.0) as i32,
+                frame_mop_blurred.cols(),
+                height as i32,
+            );
+
+            Mat::roi(&frame_mop_blurred_inv, mop_rect)?
+        };
+
         let mut contours = VectorOfMat::new();
         imgproc::find_contours(
             &frame_mop_blurred_inv,
@@ -188,18 +234,6 @@ fn main() -> Result<()> {
             imgproc::RETR_TREE,
             imgproc::CHAIN_APPROX_SIMPLE,
             Point::new(0, 0),
-        )?;
-
-        imgproc::draw_contours(
-            &mut frame,
-            &contours,
-            -1,
-            Scalar::new(0.0, 255.0, 0.0, 255.0),
-            3,
-            imgproc::LINE_8,
-            &core::no_array()?,
-            i32::MAX,
-            Point::new(x, y),
         )?;
 
         let crop_rect = core::Rect::new(x, y, width, height);
@@ -212,15 +246,30 @@ fn main() -> Result<()> {
             0,
         )?;
 
-        highgui::imshow("frame", &frame)?;
-        highgui::imshow("frame_thr", &frame_thr)?;
-        highgui::imshow("frame_mop", &frame_mop)?;
+        imgproc::draw_contours(
+            &mut frame,
+            &contours,
+            -1,
+            Scalar::new(0.0, 255.0, 0.0, 255.0),
+            3,
+            imgproc::LINE_8,
+            &core::no_array()?,
+            i32::MAX,
+            Point::new(
+                x,
+                y + ((height as f64 / 2.0 - frame_mop_blurred_inv.rows() as f64 / 2.0) as i32),
+            ),
+        )?;
 
         let key: char = highgui::wait_key(1)? as u8 as char;
 
         if key == 'q' {
             break;
         }
+
+        highgui::imshow("frame_thr", &frame_thr)?;
+        highgui::imshow("frame_mop", &frame_mop)?;
+        highgui::imshow("frame_mop_blurred_inv", &frame_mop_blurred_inv)?;
 
         let mut cwms: Vec<ContourWithMoments> = contours
             .iter()
@@ -236,38 +285,118 @@ fn main() -> Result<()> {
                     area,
                 }
             })
-            .filter(|moments| moments.area > 100_000.0)
+            .filter(|moments| moments.area > 100_000.0 * MOP_RECT_HEIGHT_PCT)
             .collect();
 
         cwms.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
         let last_cwm = cwms.iter().last();
 
-        if MANUAL_MODE {
-            // Move film forward
-            if key == 'e' {
-                scanner.move_forward(24);
-            }
+        let center = (frame_cropped.cols() as f64) / 2.0;
+        let missed = center - CENTER_TOLERANCE_MISSED;
+        let in_position = center + CENTER_TOLERANCE;
 
-            // Move film back
-            if key == 'a' {
-                scanner.move_back(24);
-            }
+        imgproc::draw_marker(
+            &mut frame,
+            Point::new(x + missed as i32, ((frame_height as f64) / 2.0) as i32),
+            Scalar::new(255.0, 0.0, 0.0, 255.0),
+            imgproc::MARKER_TRIANGLE_DOWN,
+            20,
+            1,
+            8,
+        )?;
+        imgproc::draw_marker(
+            &mut frame,
+            Point::new(x + in_position as i32, ((frame_height as f64) / 2.0) as i32),
+            Scalar::new(0.0, 255.0, 0.0, 255.0),
+            imgproc::MARKER_TRIANGLE_UP,
+            20,
+            1,
+            8,
+        )?;
 
-            // Shutter
-            if key == 's' {
-                scanner.take_photo();
+        if let Some(last) = last_cwm {
+            imgproc::draw_marker(
+                &mut frame,
+                Point::new(
+                    x + last.centroid as i32,
+                    ((frame_height as f64) / 2.0) as i32,
+                ),
+                Scalar::new(255.0, 255.0, 255.0, 255.0),
+                imgproc::MARKER_TILTED_CROSS,
+                20,
+                1,
+                8,
+            )?;
+            if last.centroid < missed {
+                println!("Frame {}px too far left", missed - last.centroid);
+            } else if last.centroid <= center + CENTER_TOLERANCE {
+                println!("Frame in position (Δ{}px)", last.centroid - center);
+            } else {
+                println!("Frame {}px too far right", last.centroid - in_position)
             }
-        } else {
+        }
+        highgui::imshow("frame", &frame)?;
+
+        // Move film forward
+        if key == 'e' {
+            scanner.move_forward(80);
+        }
+
+        // Move film back
+        if key == 'a' {
+            scanner.move_back(80);
+        }
+
+        // Shutter
+        if key == 's' {
+            scanner.take_photo();
+        }
+
+        // Focus
+        if key == 'f' {
+            scanner.focus();
+        }
+
+        if key == ' ' {
+            pause = !pause;
+        }
+
+        if pause {
+            scanner.stop();
+        } else if !MANUAL_MODE {
             match state.current {
                 ScannerState::SearchingFrame => {
-                    if let Some(last) = last_cwm {
-                        println!("Frame center detected at: {}", last.centroid);
+                    if last_cwm.is_some() {
+                        // Found a frame, pause for a second to analyze exact distance
+                        scanner.stop();
+                        state.set(ScannerState::FoundFrame {
+                            init_timestamp: SystemTime::now(),
+                            consecutive_missed_frames: 0,
+                        })
+                    } else {
+                        // Move motor at full speed until we find something
+                        scanner.move_forward(700);
+                    }
+                }
+                ScannerState::FoundFrame {
+                    init_timestamp,
+                    consecutive_missed_frames,
+                } => {
+                    // Wait until enough time has passed so that the film has stopped moving (camera feed input lag)
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 0.5 {
+                        continue;
+                    }
 
-                        if last.centroid < CENTROID_MISSED {
-                            println!("Frame moved too far");
-                            scanner.move_back(24);
-                        } else if last.centroid < CENTROID_CENTERED {
-                            println!("Frame in position");
+                    if let Some(last) = last_cwm {
+                        state.set(ScannerState::FoundFrame {
+                            init_timestamp,
+                            consecutive_missed_frames: 0,
+                        });
+
+                        if last.centroid < missed {
+                            println!("Frame moved too far, skipping to next");
+                            scanner.move_forward(500);
+                        } else if last.centroid <= center + CENTER_TOLERANCE {
                             scanner.take_photo();
 
                             state.set(ScannerState::WaitingForShutterOpen {
@@ -275,13 +404,27 @@ fn main() -> Result<()> {
                             });
                         } else {
                             println!("Stepping frame toward center");
-                            scanner.move_forward(4);
+                            let dist_px = last.centroid - in_position;
+                            println!("Distance to center: {}", dist_px);
+                            let steps = dist_px * PX_PER_STEP;
+                            let steps = steps.round().max(5.0);
+                            scanner.move_forward(steps as usize);
+                            state.set(ScannerState::SkipToNextFrame {
+                                init_timestamp: SystemTime::now(),
+                            });
                         }
+                    } else if consecutive_missed_frames > 5 {
+                        // If we can't see a frame, go back to SearchingFrame
+                        state.set(ScannerState::SearchingFrame);
                     } else {
-                        scanner.move_forward(20);
+                        state.set(ScannerState::FoundFrame {
+                            init_timestamp,
+                            consecutive_missed_frames: consecutive_missed_frames + 1,
+                        });
                     }
                 }
                 ScannerState::WaitingForShutterOpen { init_timestamp } => {
+                    highgui::imshow("frame", &frame)?;
                     // Wait until enough time has passed so that we can see the camera shutter black-out
                     if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
                         continue;
@@ -289,8 +432,8 @@ fn main() -> Result<()> {
 
                     // Crude detection of when shutter black-out ends - if last_cwm is some we are seeing a frame again
                     if last_cwm.is_some() {
-                        // Move forward enough so that we start detecting the next frame
-                        scanner.move_forward(850);
+                        // Move enough forward so that we start detecting the next frame
+                        scanner.move_forward(1000);
 
                         state.set(ScannerState::SkipToNextFrame {
                             init_timestamp: SystemTime::now(),
@@ -299,11 +442,14 @@ fn main() -> Result<()> {
                 }
 
                 ScannerState::SkipToNextFrame { init_timestamp } => {
+                    highgui::imshow("frame", &frame)?;
+                    // scanner.focus();
                     // Wait until enough time has passed so that the film has moved far enough
                     if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
                         continue;
                     }
 
+                    // scanner.focus();
                     state.set(ScannerState::SearchingFrame);
                 }
             }

@@ -1,3 +1,4 @@
+#include <AccelStepper.h>
 
 const int RST_PIN = 3;
 const int SLP_PIN = 4;
@@ -7,7 +8,11 @@ const int FOCUS_PIN = 9;
 const int SHUTTER_PIN = 10;
 const int MICROSTEP_PIN = 11;
 
-const int STEP_PULSE = 800;
+const int STEP_PULSE = 600;
+
+String serial_buffer = "";
+
+AccelStepper stepper(1, STEP_PIN, DIR_PIN);
 
 void setup() {
   pinMode(SHUTTER_PIN, OUTPUT);
@@ -22,8 +27,8 @@ void setup() {
   pinMode(DIR_PIN, OUTPUT);
   digitalWrite(DIR_PIN, LOW);
   
-  // Enable quarter microstepping
-  digitalWrite(MICROSTEP_PIN, HIGH);
+  // (don't) enable quarter microstepping
+  digitalWrite(MICROSTEP_PIN, LOW);
   pinMode(MICROSTEP_PIN, OUTPUT);
   
   pinMode(RST_PIN, OUTPUT);
@@ -32,36 +37,25 @@ void setup() {
   pinMode(SLP_PIN, OUTPUT);
   digitalWrite(SLP_PIN, HIGH);
   
-//  Serial.begin(115200);
-  Serial.begin(19200);
-//  Serial.begin(38400);
+  Serial.begin(115200);
+
+  stepper.setMaxSpeed(1500); // 1600 ~= max before motor starts missing steps
+  stepper.setAcceleration(10000);
 }
 
 void loop() {
   if (Serial.available() > 0) {
-    int incoming_byte = Serial.read();
+    char incoming_byte = Serial.read();
     
-    if (incoming_byte == 'L') {
-      digitalWrite(SLP_PIN, HIGH);
-      
-      // Step to the left
-      digitalWrite(DIR_PIN, LOW);
-      digitalWrite(STEP_PIN, HIGH);
-      delayMicroseconds(STEP_PULSE);
-      digitalWrite(STEP_PIN, LOW);
-      delayMicroseconds(STEP_PULSE);
+    if (incoming_byte == 'M') {
+      int steps = serial_buffer.toInt();
+      serial_buffer = "";
+      stepper.move(steps); // 1300 ~= one frame
     }
-    else if (incoming_byte == 'R') {
-      digitalWrite(SLP_PIN, HIGH);
-      
-      // Step to the right
-      digitalWrite(DIR_PIN, HIGH);
-      digitalWrite(STEP_PIN, HIGH);
-      delayMicroseconds(STEP_PULSE);
-      digitalWrite(STEP_PIN, LOW);
-      delayMicroseconds(STEP_PULSE);
+    else if (incoming_byte == 'S') {
+      stepper.stop();
     }
-    if (incoming_byte == 'S') {
+    else if (incoming_byte == 's') {
       // Force motor to stop to avoid vibrations
       digitalWrite(SLP_PIN, LOW);
       
@@ -75,5 +69,19 @@ void loop() {
 
       digitalWrite(FOCUS_PIN, HIGH);
     }
+    else if (incoming_byte == 'f') {
+      // Focus
+      digitalWrite(FOCUS_PIN, HIGH);
+      delay(50);
+      digitalWrite(FOCUS_PIN, LOW);
+    }
+    else if (incoming_byte == '\n') {
+      // Ignore newline
+    }
+    else {
+      serial_buffer += incoming_byte;
+    }
   }
+  
+  stepper.run();
 }
