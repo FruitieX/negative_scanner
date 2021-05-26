@@ -41,6 +41,7 @@ void setup() {
 
   stepper.setMaxSpeed(1500); // 1600 ~= max before motor starts missing steps
   stepper.setAcceleration(10000);
+  stepper.setPinsInverted(true);
 }
 
 void loop() {

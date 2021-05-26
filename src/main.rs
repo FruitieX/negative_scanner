@@ -476,7 +476,7 @@ fn main() -> Result<()> {
                     // Crude detection of when shutter black-out ends - if last_cwm is some we are seeing a frame again
                     if last_cwm.is_some() {
                         // Move enough forward so that we start detecting the next frame
-                        scanner.move_forward(1000, false);
+                        scanner.move_forward(1100, false);
 
                         state.set(ScannerState::SkipToNextFrame {
                             init_timestamp: SystemTime::now(),
