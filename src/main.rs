@@ -11,10 +11,11 @@ use serialport::SerialPort;
 
 const CONTROLS_WINDOW: &str = "controls";
 const MANUAL_MODE: bool = false;
-const CENTER_TOLERANCE: f64 = 20.0;
+const CENTER_TOLERANCE: f64 = 10.0;
 const CENTER_TOLERANCE_MISSED: f64 = 20.0;
 const PX_PER_STEP: f64 = 5.0;
 const MOP_RECT_HEIGHT_PCT: f64 = 0.2;
+const NEXT_FRAME_SKIP_STEPS: usize = 1000;
 
 struct State {
     current: ScannerState,
@@ -104,7 +105,7 @@ impl Scanner {
     }
 
     fn write(&mut self, buf: &str) {
-        // println!("Writing to serial: {}", buf);
+        println!("Writing to serial: {}", buf);
 
         let bytes = buf.as_bytes();
         // println!("Bytes: {:?}", bytes);
@@ -116,7 +117,7 @@ impl Scanner {
 
 fn main() -> Result<()> {
     let port_infos = serialport::available_ports().expect("No serial ports found");
-    let port_info = port_infos.first().expect("No serial ports found");
+    let port_info = port_infos.iter().nth(1).expect("No serial ports found");
     let port = serialport::new(port_info.port_name.clone(), 115_200)
         .timeout(Duration::from_secs(1))
         .open()
@@ -152,7 +153,7 @@ fn main() -> Result<()> {
     highgui::named_window(CONTROLS_WINDOW, 1)?;
 
     highgui::create_trackbar("x", CONTROLS_WINDOW, &mut 52, frame_width - 1, None)?;
-    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 26, frame_height - 1, None)?;
+    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 0, frame_height - 1, None)?;
     highgui::create_trackbar(
         "width",
         CONTROLS_WINDOW,
@@ -163,7 +164,7 @@ fn main() -> Result<()> {
     highgui::create_trackbar(
         "height",
         CONTROLS_WINDOW,
-        &mut (frame_height - 22 - 26),
+        &mut (frame_height - 0),
         frame_height,
         None,
     )?;
@@ -352,16 +353,27 @@ fn main() -> Result<()> {
             //     println!("Frame {}px too far right", last.centroid - in_position)
             // }
         }
-        highgui::imshow("frame", &frame)?;
+
+        let mut frame_inv = Mat::default();
+        core::bitwise_not(&frame, &mut frame_inv, &core::no_array()?)?;
+        highgui::imshow("frame", &frame_inv)?;
 
         // Move film forward
         if key == 'e' {
-            scanner.move_forward(80, false);
+            scanner.move_forward(30, false);
+        }
+        // FF forward
+        if key == '.' {
+            scanner.move_forward(100, false);
         }
 
         // Move film back
         if key == 'a' {
-            scanner.move_back(80);
+            scanner.move_back(30);
+        }
+        // FF back
+        if key == '\'' {
+            scanner.move_back(100);
         }
 
         // Shutter
@@ -387,15 +399,15 @@ fn main() -> Result<()> {
         if key == ' ' {
             pause = !pause;
             if pause {
+                state.set(ScannerState::SearchingFrame);
                 println!("Paused. Hit spacebar to unpause.");
+                scanner.stop(true);
             } else {
                 println!("Unpaused. Hit spacebar to pause.");
             }
         }
 
-        if pause {
-            scanner.stop(true);
-        } else if !MANUAL_MODE {
+        if !pause && !MANUAL_MODE {
             match state.current {
                 ScannerState::SearchingFrame => {
                     if last_cwm.is_some() {
@@ -476,7 +488,7 @@ fn main() -> Result<()> {
                     // Crude detection of when shutter black-out ends - if last_cwm is some we are seeing a frame again
                     if last_cwm.is_some() {
                         // Move enough forward so that we start detecting the next frame
-                        scanner.move_forward(1100, false);
+                        scanner.move_forward(NEXT_FRAME_SKIP_STEPS, false);
 
                         state.set(ScannerState::SkipToNextFrame {
                             init_timestamp: SystemTime::now(),
