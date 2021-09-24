@@ -12,10 +12,10 @@ use serialport::SerialPort;
 const CONTROLS_WINDOW: &str = "controls";
 const MANUAL_MODE: bool = false;
 const CENTER_TOLERANCE: f64 = 10.0;
-const CENTER_TOLERANCE_MISSED: f64 = 20.0;
+const CENTER_TOLERANCE_MISSED: f64 = 15.0;
 const PX_PER_STEP: f64 = 5.0;
-const MOP_RECT_HEIGHT_PCT: f64 = 0.2;
-const NEXT_FRAME_SKIP_STEPS: usize = 1000;
+const MOP_RECT_HEIGHT_PCT: f64 = 0.95;
+const NEXT_FRAME_SKIP_STEPS: usize = 3000;
 
 struct State {
     current: ScannerState,
@@ -53,18 +53,35 @@ impl State {
 
 struct ContourWithMoments {
     contour: Mat,
+    frame_center_x: f64,
     moments: Moments,
     centroid: f64,
     area: f64,
 }
 
 struct Scanner {
-    port: Box<dyn SerialPort>,
+    tx: std::sync::mpsc::Sender<String>,
 }
 
 impl Scanner {
-    pub fn new(port: Box<dyn SerialPort>) -> Scanner {
-        Scanner { port }
+    pub fn new(mut port: Box<dyn SerialPort>) -> Scanner {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+        std::thread::spawn(move || {
+            loop {
+                let msg = rx.recv();
+
+                if let Ok(msg) = msg {
+                    println!("Writing to serial: {}", msg);
+                    let bytes: &[u8] = msg.as_bytes();
+                    // println!("Bytes: {:?}", bytes);
+                    port.write_all(bytes)
+                        .expect("Writing to serial port failed");
+                }
+            }
+        });
+
+        Scanner { tx }
     }
 
     pub fn move_forward(&mut self, steps: usize, silent: bool) {
@@ -73,13 +90,13 @@ impl Scanner {
         }
 
         // 1300 ~= one frame
-        self.write(&format!("{}M", steps));
+        self.write(&format!("-{}M", steps));
     }
 
     pub fn move_back(&mut self, steps: usize) {
         println!("Moving back {} steps", steps);
 
-        self.write(&format!("-{}M", steps));
+        self.write(&format!("{}M", steps));
     }
 
     pub fn stop(&mut self, silent: bool) {
@@ -105,13 +122,7 @@ impl Scanner {
     }
 
     fn write(&mut self, buf: &str) {
-        println!("Writing to serial: {}", buf);
-
-        let bytes = buf.as_bytes();
-        // println!("Bytes: {:?}", bytes);
-        self.port
-            .write_all(bytes)
-            .expect("Writing to serial port failed");
+        self.tx.send(buf.to_string()).ok();
     }
 }
 
@@ -132,6 +143,7 @@ fn main() -> Result<()> {
     println!("a = Move film back");
     println!("s = Shutter");
     println!("f = Focus");
+    println!("n = Next frame");
     println!("u = Stop focus");
 
     let mut scanner = Scanner::new(port);
@@ -202,7 +214,7 @@ fn main() -> Result<()> {
             255.0,
             imgproc::ADAPTIVE_THRESH_GAUSSIAN_C,
             imgproc::THRESH_BINARY,
-            5,
+            13,
             2.into(),
         )?;
 
@@ -279,7 +291,7 @@ fn main() -> Result<()> {
             ),
         )?;
 
-        let key: char = highgui::wait_key(1)? as u8 as char;
+        let key: char = highgui::poll_key()? as u8 as char;
 
         if key == 'q' {
             break;
@@ -296,8 +308,22 @@ fn main() -> Result<()> {
                 let centroid = moments.m10 / moments.m00;
                 let area = imgproc::contour_area(&contour, false).unwrap();
 
+                let bbox = imgproc::bounding_rect(&contour).unwrap();
+                let seen_width = bbox.width as f64;
+                let seen_end = bbox.x as f64 + seen_width;
+                let aspect_ratio = 4.0 / 3.0 / 1.195;
+                let h = bbox.height as f64;
+                let w = h * aspect_ratio;
+                let pos_x = if centroid > width as f64 / 2.0 {
+                    bbox.x as f64
+                } else {
+                    seen_end - w
+                };
+                let frame_center_x = pos_x + w / 2.0;
+
                 ContourWithMoments {
                     contour,
+                    frame_center_x,
                     moments,
                     centroid,
                     area,
@@ -336,7 +362,7 @@ fn main() -> Result<()> {
             imgproc::draw_marker(
                 &mut frame,
                 Point::new(
-                    x + last.centroid as i32,
+                    x + last.frame_center_x as i32,
                     ((frame_height as f64) / 2.0) as i32,
                 ),
                 Scalar::new(255.0, 255.0, 255.0, 255.0),
@@ -360,7 +386,7 @@ fn main() -> Result<()> {
 
         // Move film forward
         if key == 'e' {
-            scanner.move_forward(30, false);
+            scanner.move_forward(60, false);
         }
         // FF forward
         if key == '.' {
@@ -369,7 +395,7 @@ fn main() -> Result<()> {
 
         // Move film back
         if key == 'a' {
-            scanner.move_back(30);
+            scanner.move_back(60);
         }
         // FF back
         if key == '\'' {
@@ -389,6 +415,10 @@ fn main() -> Result<()> {
         // Stop focus
         if key == 'u' {
             scanner.stop_focus();
+        }
+
+        if key == 'n' {
+            scanner.move_forward(NEXT_FRAME_SKIP_STEPS / 2, false);
         }
 
         // Reset
@@ -417,7 +447,7 @@ fn main() -> Result<()> {
                             init_timestamp: SystemTime::now(),
                             consecutive_missed_frames: 0,
                             // Wait until enough time has passed so that the film has stopped moving (camera feed input lag)
-                            wait_time: 0.5,
+                            wait_time: 0.7,
                         })
                     } else {
                         // Move motor at full speed until we find something
@@ -440,14 +470,15 @@ fn main() -> Result<()> {
                             wait_time,
                         });
 
-                        if last.centroid < missed {
-                            println!("Frame moved too far, skipping to next");
-                            scanner.move_forward(500, false);
-                        } else if last.centroid <= center + CENTER_TOLERANCE {
+                        if last.frame_center_x < missed {
+                            println!("Frame moved too far, pausing");
+                            dbg!(last.frame_center_x, missed);
+                            pause = !pause;
+                        } else if last.frame_center_x <= center + CENTER_TOLERANCE {
                             scanner.focus();
                             println!(
                                 "Taking picture with frame position Δ{}px",
-                                last.centroid - center
+                                last.frame_center_x - center
                             );
                             scanner.take_photo();
                             scanner.stop_focus();
@@ -457,7 +488,7 @@ fn main() -> Result<()> {
                             });
                         } else {
                             println!("Stepping frame toward center");
-                            let dist_px = last.centroid - in_position;
+                            let dist_px = last.frame_center_x - in_position;
                             println!("Distance to center: {}", dist_px);
                             let steps = dist_px * PX_PER_STEP;
                             let steps = steps.round().max(5.0);
@@ -465,7 +496,7 @@ fn main() -> Result<()> {
                             state.set(ScannerState::FoundFrame {
                                 init_timestamp: SystemTime::now(),
                                 consecutive_missed_frames: 0,
-                                wait_time: 1.0, // TODO: variable wait time based on number of steps
+                                wait_time: 0.2 + steps / 1000.0,
                             });
                         }
                     } else if consecutive_missed_frames > 5 {
@@ -499,7 +530,7 @@ fn main() -> Result<()> {
                 ScannerState::SkipToNextFrame { init_timestamp } => {
                     // scanner.focus();
                     // Wait until enough time has passed so that the film has moved far enough
-                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.5 {
                         continue;
                     }
 
