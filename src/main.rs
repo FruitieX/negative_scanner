@@ -12,10 +12,11 @@ use serialport::SerialPort;
 const CONTROLS_WINDOW: &str = "controls";
 const MANUAL_MODE: bool = false;
 const CENTER_TOLERANCE: f64 = 10.0;
-const CENTER_TOLERANCE_MISSED: f64 = 15.0;
-const PX_PER_STEP: f64 = 5.0;
-const MOP_RECT_HEIGHT_PCT: f64 = 0.95;
-const NEXT_FRAME_SKIP_STEPS: usize = 3000;
+const CENTER_TOLERANCE_MISSED: f64 = 8.0;
+const PX_PER_STEP: f64 = 4.5;
+const MOP_RECT_HEIGHT_PCT: f64 = 0.97;
+// const NEXT_FRAME_SKIP_STEPS: usize = 2825;
+const NEXT_FRAME_SKIP_STEPS: usize = 2670;
 
 struct State {
     current: ScannerState,
@@ -28,6 +29,9 @@ enum ScannerState {
         init_timestamp: SystemTime,
         wait_time: f64,
         consecutive_missed_frames: usize,
+    },
+    TakingPhoto {
+        init_timestamp: SystemTime,
     },
     WaitingForShutterOpen {
         init_timestamp: SystemTime,
@@ -61,6 +65,7 @@ struct ContourWithMoments {
 
 struct Scanner {
     tx: std::sync::mpsc::Sender<String>,
+    prev_dir: bool,
 }
 
 impl Scanner {
@@ -72,7 +77,7 @@ impl Scanner {
                 let msg = rx.recv();
 
                 if let Ok(msg) = msg {
-                    println!("Writing to serial: {}", msg);
+                    // println!("Writing to serial: {}", msg);
                     let bytes: &[u8] = msg.as_bytes();
                     // println!("Bytes: {:?}", bytes);
                     port.write_all(bytes)
@@ -81,22 +86,21 @@ impl Scanner {
             }
         });
 
-        Scanner { tx }
+        Scanner {
+            tx,
+            prev_dir: false,
+        }
     }
 
     pub fn move_forward(&mut self, steps: usize, silent: bool) {
-        if !silent {
-            println!("Moving forward {} steps", steps);
-        }
-
         // 1300 ~= one frame
         self.write(&format!("-{}M", steps));
+        self.prev_dir = true;
     }
 
     pub fn move_back(&mut self, steps: usize) {
-        println!("Moving back {} steps", steps);
-
         self.write(&format!("{}M", steps));
+        self.prev_dir = false;
     }
 
     pub fn stop(&mut self, silent: bool) {
@@ -105,6 +109,12 @@ impl Scanner {
         }
 
         self.write("0M");
+
+        if self.prev_dir {
+            self.write("50M");
+        } else {
+            self.write("-50M");
+        }
     }
 
     pub fn take_photo(&mut self) {
@@ -418,7 +428,7 @@ fn main() -> Result<()> {
         }
 
         if key == 'n' {
-            scanner.move_forward(NEXT_FRAME_SKIP_STEPS / 2, false);
+            scanner.move_forward(NEXT_FRAME_SKIP_STEPS, false);
         }
 
         // Reset
@@ -463,6 +473,8 @@ fn main() -> Result<()> {
                         continue;
                     }
 
+                    scanner.stop(false);
+
                     if let Some(last) = last_cwm {
                         state.set(ScannerState::FoundFrame {
                             init_timestamp,
@@ -480,23 +492,19 @@ fn main() -> Result<()> {
                                 "Taking picture with frame position Δ{}px",
                                 last.frame_center_x - center
                             );
-                            scanner.take_photo();
-                            scanner.stop_focus();
-
-                            state.set(ScannerState::WaitingForShutterOpen {
-                                init_timestamp: SystemTime::now(),
-                            });
+                            scanner.move_back(50);
+                            state.set(ScannerState::TakingPhoto { init_timestamp });
                         } else {
                             println!("Stepping frame toward center");
-                            let dist_px = last.frame_center_x - in_position;
+                            let dist_px = last.frame_center_x - center;
                             println!("Distance to center: {}", dist_px);
                             let steps = dist_px * PX_PER_STEP;
-                            let steps = steps.round().max(5.0);
+                            let steps = steps.round(); //.max(5.0);
                             scanner.move_forward(steps as usize, false);
                             state.set(ScannerState::FoundFrame {
                                 init_timestamp: SystemTime::now(),
                                 consecutive_missed_frames: 0,
-                                wait_time: 0.2 + steps / 1000.0,
+                                wait_time: 0.3 + steps / 1000.0,
                             });
                         }
                     } else if consecutive_missed_frames > 5 {
@@ -509,6 +517,19 @@ fn main() -> Result<()> {
                             wait_time,
                         });
                     }
+                }
+                ScannerState::TakingPhoto { init_timestamp } => {
+                    // Wait until enough time has passed so that the film has come to a stop
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.0 {
+                        continue;
+                    }
+
+                    scanner.take_photo();
+                    scanner.stop_focus();
+
+                    state.set(ScannerState::WaitingForShutterOpen {
+                        init_timestamp: SystemTime::now(),
+                    });
                 }
                 ScannerState::WaitingForShutterOpen { init_timestamp } => {
                     // Wait until enough time has passed so that we can see the camera shutter black-out
@@ -530,7 +551,7 @@ fn main() -> Result<()> {
                 ScannerState::SkipToNextFrame { init_timestamp } => {
                     // scanner.focus();
                     // Wait until enough time has passed so that the film has moved far enough
-                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 1.5 {
+                    if init_timestamp.elapsed().unwrap().as_secs_f64() < 2.0 {
                         continue;
                     }
 
