@@ -39,7 +39,7 @@ void setup() {
   
   Serial.begin(115200);
 
-  stepper.setMaxSpeed(1500); // 1600 ~= max before motor starts missing steps
+  stepper.setMaxSpeed(1400); // 1600 ~= max before motor starts missing steps
   stepper.setAcceleration(12000);
   stepper.setPinsInverted(true);
 }
