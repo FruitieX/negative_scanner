@@ -11,12 +11,12 @@ use serialport::SerialPort;
 
 const CONTROLS_WINDOW: &str = "controls";
 const MANUAL_MODE: bool = false;
-const CENTER_TOLERANCE: f64 = 10.0;
+const CENTER_TOLERANCE: f64 = 5.0;
 const CENTER_TOLERANCE_MISSED: f64 = 8.0;
 const PX_PER_STEP: f64 = 4.5;
-const MOP_RECT_HEIGHT_PCT: f64 = 0.97;
+const MOP_RECT_HEIGHT_PCT: f64 = 1.0;
 // const NEXT_FRAME_SKIP_STEPS: usize = 2825;
-const NEXT_FRAME_SKIP_STEPS: usize = 2670;
+const NEXT_FRAME_SKIP_STEPS: usize = 2650;
 
 struct State {
     current: ScannerState,
@@ -434,6 +434,13 @@ fn main() -> Result<()> {
         // Reset
         if key == 'r' {
             state.set(ScannerState::SearchingFrame);
+        }
+
+        if key == 't' {
+            state.set(ScannerState::TakingPhoto {
+                init_timestamp: SystemTime::now() - Duration::from_secs(1),
+            });
+            pause = false;
         }
 
         if key == ' ' {

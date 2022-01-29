@@ -1,0 +1,1 @@
+Setup OpenCV according to https://github.com/twistedfall/opencv-rust
