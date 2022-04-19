@@ -28,9 +28,6 @@ const MSEC_PER_1000_STEPS: u64 = 700;
 /// (maxSpeed / acceleration)
 const STEPPER_ACCEL_TIME: u64 = 120;
 
-/// Account for camera not responding to shutter button press instantly
-const SHUTTER_EXTRA_WAIT_MSEC: u64 = 200;
-
 /// How many steps to move the film forward after taking a photo
 const NEXT_FRAME_SKIP_STEPS: usize = 2500;
 
@@ -51,9 +48,8 @@ enum ScannerState {
     TakingPhoto {
         wait_until: Instant,
     },
-    WaitingForShutterOpen {
-        wait_until: Instant,
-    },
+    WaitingForShutterClose,
+    WaitingForShutterOpen,
     SkipToNextFrame {
         wait_until: Instant,
     },
@@ -344,7 +340,7 @@ fn main() -> Result<()> {
         )?;
 
         // Perform noise reduction on the adaptive thresholding result
-        let sizes = vec![2, 2].into_iter().collect();
+        let sizes = vec![3, 3].into_iter().collect();
         let kernel = Mat::new_nd_vec_with_default(&sizes, 0, Scalar::from(255.0))?;
         imgproc::morphology_ex(
             &adaptive_thr.clone(),
@@ -416,7 +412,7 @@ fn main() -> Result<()> {
             .collect();
 
         cwms.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
-        let last_cwm = cwms.iter().last();
+        let largest_cwm = cwms.iter().last();
 
         // cwms.sort_by(|a, b| a.end_x.partial_cmp(&b.end_x).unwrap());
         // let last_cwm = cwms.first();
@@ -493,19 +489,37 @@ fn main() -> Result<()> {
                     wait_until,
                     last_seen_x,
                 } => {
-                    match last_cwm {
-                        Some(last_cwm) => {
-                            // Always update last seen x position to state
-                            state.set(ScannerState::AligningFrame {
-                                wait_until,
-                                last_seen_x: Some(last_cwm.end_x),
-                            });
+                    match largest_cwm {
+                        Some(largest_cwm) => {
+                            let end_x = largest_cwm.end_x;
+
+                            // Don't allow last_seen_x to change by over some large delta
+                            if let Some(last_seen_x) = last_seen_x {
+                                let delta = (last_seen_x - end_x).abs();
+                                if delta < 100.0 {
+                                    state.set(ScannerState::AligningFrame {
+                                        wait_until,
+                                        last_seen_x: Some(end_x),
+                                    });
+                                } else {
+                                    println!("end_x changed by {}px in one frame, stopping", delta);
+                                    scanner.stop(true);
+                                    pause = true;
+                                    // state.set(ScannerState::Error)
+                                }
+                            } else {
+                                // Always update last seen x position to state
+                                state.set(ScannerState::AligningFrame {
+                                    wait_until,
+                                    last_seen_x: Some(end_x),
+                                });
+                            }
 
                             // Immediately stop film if frame moves past
                             // detection point
                             if let Some(last_seen_x) = last_seen_x {
-                                let moved_past_detection_point = last_seen_x >= NEW_DETECTION_POS
-                                    && last_cwm.end_x < NEW_DETECTION_POS;
+                                let moved_past_detection_point =
+                                    last_seen_x >= NEW_DETECTION_POS && end_x < NEW_DETECTION_POS;
 
                                 if moved_past_detection_point {
                                     scanner.stop(true);
@@ -513,7 +527,7 @@ fn main() -> Result<()> {
                                         wait_until: Instant::now()
                                             + Duration::from_millis(INPUT_LAG_MSEC)
                                             + Duration::from_millis(STEPPER_ACCEL_TIME),
-                                        last_seen_x: Some(last_cwm.end_x),
+                                        last_seen_x: Some(end_x),
                                     });
 
                                     continue;
@@ -527,12 +541,12 @@ fn main() -> Result<()> {
 
                             // Frame gap found in last_cwm, move film forward
                             // towards end of gap
-                            let steps = last_cwm.end_x * PX_PER_STEP;
+                            let steps = end_x * PX_PER_STEP;
                             let steps = steps.round(); //.max(5.0);
                             let steps = steps + 50.0;
                             println!(
                                 "{} px to end of frame gap, moving motor {} steps",
-                                last_cwm.end_x, steps
+                                end_x, steps
                             );
                             scanner.move_forward(steps as usize, true);
 
@@ -547,7 +561,7 @@ fn main() -> Result<()> {
 
                             state.set(ScannerState::AligningFrame {
                                 wait_until: Instant::now() + wait_time,
-                                last_seen_x: Some(last_cwm.end_x),
+                                last_seen_x: Some(end_x),
                             })
                         }
                         None => {
@@ -580,19 +594,21 @@ fn main() -> Result<()> {
                     scanner.take_photo();
                     scanner.stop_focus();
 
-                    let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
-                        + Duration::from_millis(SHUTTER_EXTRA_WAIT_MSEC);
-
-                    state.set(ScannerState::WaitingForShutterOpen {
-                        wait_until: Instant::now() + wait_time,
-                    });
+                    state.set(ScannerState::WaitingForShutterClose);
                 }
-                ScannerState::WaitingForShutterOpen { wait_until } => {
-                    // Wait until enough time has passed so that we can see the camera shutter black-out
-                    if Instant::now() < wait_until {
-                        continue;
+                ScannerState::WaitingForShutterClose => {
+                    // Crude detection of when shutter black-out ends - wait
+                    // until we see less than 2000 non zero pixels (Fujifilm
+                    // X-T200 UI draws around 1000 non zero pixels during
+                    // shutter black-out)
+                    let non_zero_px = core::count_non_zero(&frame_bw)?;
+                    if non_zero_px <= 2000 {
+                        state.set(ScannerState::WaitingForShutterOpen);
+                    } else {
+                        println!("Waiting for start of shutter black-out")
                     }
-
+                }
+                ScannerState::WaitingForShutterOpen => {
                     // Crude detection of when shutter black-out ends - wait
                     // until we see more than 2000 non zero pixels (Fujifilm
                     // X-T200 UI draws around 1000 non zero pixels during
