@@ -202,7 +202,7 @@ fn mask_non_full_cols(mat: &Mat) -> Result<Mat> {
 
 fn main() -> Result<()> {
     let port_infos = serialport::available_ports().expect("No serial ports found");
-    let port_info = port_infos.get(1).expect("No serial ports found");
+    let port_info = port_infos.first().expect("No serial ports found");
     let port = serialport::new(port_info.port_name.clone(), 115_200)
         .timeout(Duration::from_secs(1))
         .open()
@@ -240,23 +240,23 @@ fn main() -> Result<()> {
 
     highgui::named_window(CONTROLS_WINDOW, 1)?;
 
-    highgui::create_trackbar("x", CONTROLS_WINDOW, &mut 52, frame_width - 1, None)?;
-    highgui::create_trackbar("y", CONTROLS_WINDOW, &mut 0, frame_height - 1, None)?;
+    highgui::create_trackbar("x", CONTROLS_WINDOW, Some(&mut 52), frame_width - 1, None)?;
+    highgui::create_trackbar("y", CONTROLS_WINDOW, Some(&mut 0), frame_height - 1, None)?;
     highgui::create_trackbar(
         "width",
         CONTROLS_WINDOW,
-        &mut (frame_width - 52 - 52),
+        Some(&mut (frame_width - 52 - 52)),
         frame_width,
         None,
     )?;
     highgui::create_trackbar(
         "height",
         CONTROLS_WINDOW,
-        &mut frame_height.clone(),
+        Some(&mut frame_height.clone()),
         frame_height,
         None,
     )?;
-    highgui::create_trackbar("param", CONTROLS_WINDOW, &mut 0, 255, None)?;
+    highgui::create_trackbar("param", CONTROLS_WINDOW, Some(&mut 0), 255, None)?;
 
     let mut state = State::new();
 
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
         // Convert frame to grayscale
         let mut frame_bw = Mat::default();
         imgproc::cvt_color(&frame_blurred, &mut frame_bw, imgproc::COLOR_RGB2GRAY, 0)?;
-        // highgui::imshow("frame_bw", &frame_bw)?;
+        highgui::imshow("frame_bw", &frame_bw)?;
 
         // Try finding a threshold value that results in at least one column
         // full of white pixels
@@ -402,7 +402,6 @@ fn main() -> Result<()> {
             })
             // .filter(|moments| moments.area > 100_000.0)
             .filter(|ctr| ctr.area > 0.0)
-
             // Filter out small areas unless they are at the left or right of the frame
             .filter(|ctr| {
                 (ctr.start_x <= 10.0 || ctr.end_x >= width as f64 - 10.0) || ctr.area > 5000.0
@@ -417,7 +416,7 @@ fn main() -> Result<()> {
             Scalar::new(0.0, 255.0, 0.0, 255.0),
             3,
             imgproc::LINE_8,
-            &core::no_array()?,
+            &core::no_array(),
             i32::MAX,
             Point::new(
                 x,
@@ -432,7 +431,7 @@ fn main() -> Result<()> {
         // let last_ctr = ctrs.first();
 
         let mut frame_inv = Mat::default();
-        core::bitwise_not(&frame, &mut frame_inv, &core::no_array()?)?;
+        core::bitwise_not(&frame, &mut frame_inv, &core::no_array())?;
         highgui::imshow("frame", &frame_inv)?;
 
         // Move film forward

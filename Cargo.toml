@@ -10,5 +10,5 @@ edition = "2018"
 debug = 0
 
 [dependencies]
-opencv = "0.53"
+opencv = "0.63.1"
 serialport = "4.0.1"
