@@ -316,7 +316,7 @@ fn main() -> Result<()> {
             imgproc::threshold(
                 &frame_bw,
                 &mut frame_bw_thr,
-                test_thr - 5.0,
+                test_thr - 10.0,
                 255.0,
                 imgproc::THRESH_BINARY,
             )?;
@@ -543,20 +543,29 @@ fn main() -> Result<()> {
                             let small_area = area < 5000.0;
 
                             // Don't allow last_seen_x to change by over some large delta
-                            if let Some(last_seen_x) = last_seen_x {
+                            let large_delta = if let Some(last_seen_x) = last_seen_x {
                                 let delta = (last_seen_x - end_x).abs();
                                 if delta < 100.0 {
                                     state.set(ScannerState::AligningFrame {
                                         wait_until,
                                         last_seen_x: Some(end_x),
                                     });
-                                } else if !small_area {
-                                    println!(
-                                        "end_x changed by {}px in one frame, stopping (area: {})",
-                                        delta, area
-                                    );
-                                    scanner.stop(true);
-                                    pause = true;
+
+                                    false
+                                } else {
+                                    if !small_area {
+                                        println!(
+                                            "end_x changed by {}px in one frame, stopping (area: {})",
+                                            delta, area
+                                        );
+                                    } else {
+                                        println!(
+                                            "end_x changed by {}px in one frame, not stopping due to small area (area: {})",
+                                            delta, area
+                                        );
+                                    }
+
+                                    true
                                 }
                             } else {
                                 // Always update last seen x position to state
@@ -564,6 +573,18 @@ fn main() -> Result<()> {
                                     wait_until,
                                     last_seen_x: Some(end_x),
                                 });
+
+                                false
+                            };
+
+                            if large_delta && !small_area {
+                                scanner.stop(true);
+                                pause = true;
+                            }
+
+                            if large_delta {
+                                println!("waiting if large delta goes away...");
+                                continue;
                             }
 
                             // Immediately stop film if frame moves past
