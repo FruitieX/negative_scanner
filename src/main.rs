@@ -83,8 +83,10 @@ impl State {
 }
 
 struct Contour {
+    contour: Mat,
     area: f64,
     end_x: f64,
+    start_x: f64,
 }
 
 struct Scanner {
@@ -292,7 +294,7 @@ fn main() -> Result<()> {
         let mut test_thr = 255.0;
         let mut frame_bw_thr = Mat::default();
         let mut found_full_col = false;
-        while test_thr > 170.0 {
+        while test_thr > 130.0 {
             imgproc::threshold(
                 &frame_bw,
                 &mut frame_bw_thr,
@@ -336,7 +338,7 @@ fn main() -> Result<()> {
             255.0,
             imgproc::ADAPTIVE_THRESH_GAUSSIAN_C,
             imgproc::THRESH_BINARY,
-            7 * 2 + 1,
+            11 * 2 + 1,
             2.into(),
         )?;
 
@@ -353,7 +355,7 @@ fn main() -> Result<()> {
             opencv::core::BORDER_CONSTANT,
             imgproc::morphology_default_border_value()?,
         )?;
-        // highgui::imshow("pre_mask_adaptive", &adaptive_thr)?;
+        highgui::imshow("pre_mask_adaptive", &adaptive_thr)?;
 
         // Mask out columns with pixels below the threshold
         let adaptive_thr = mask_non_full_cols(&adaptive_thr)?;
@@ -375,21 +377,6 @@ fn main() -> Result<()> {
             Point::new(0, 0),
         )?;
 
-        imgproc::draw_contours(
-            &mut frame,
-            &contours,
-            -1,
-            Scalar::new(0.0, 255.0, 0.0, 255.0),
-            3,
-            imgproc::LINE_8,
-            &core::no_array()?,
-            i32::MAX,
-            Point::new(
-                x,
-                y + ((height as f64 / 2.0 - frame_bw_thr.rows() as f64 / 2.0) as i32),
-            ),
-        )?;
-
         let key: char = highgui::poll_key()? as u8 as char;
 
         if key == 'q' {
@@ -407,20 +394,42 @@ fn main() -> Result<()> {
                 let seen_end = bbox.x as f64 + seen_width;
 
                 Contour {
+                    contour,
                     area,
                     end_x: seen_end,
+                    start_x: bbox.x as f64,
                 }
             })
             // .filter(|moments| moments.area > 100_000.0)
+            .filter(|ctr| ctr.area > 0.0)
+
+            // Filter out small areas unless they are at the left or right of the frame
+            .filter(|ctr| {
+                (ctr.start_x <= 10.0 || ctr.end_x >= width as f64 - 10.0) || ctr.area > 5000.0
+            })
             .collect();
+
+        let filtered_contours: VectorOfMat = ctrs.iter().map(|ctr| ctr.contour.clone()).collect();
+        imgproc::draw_contours(
+            &mut frame,
+            &filtered_contours,
+            -1,
+            Scalar::new(0.0, 255.0, 0.0, 255.0),
+            3,
+            imgproc::LINE_8,
+            &core::no_array()?,
+            i32::MAX,
+            Point::new(
+                x,
+                y + ((height as f64 / 2.0 - frame_bw_thr.rows() as f64 / 2.0) as i32),
+            ),
+        )?;
 
         ctrs.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
         let largest_ctr = ctrs.iter().last();
 
         // ctrs.sort_by(|a, b| a.end_x.partial_cmp(&b.end_x).unwrap());
         // let last_ctr = ctrs.first();
-
-        // dbg!(last_ctr.map(|ctr| ctr.end_x));
 
         let mut frame_inv = Mat::default();
         core::bitwise_not(&frame, &mut frame_inv, &core::no_array()?)?;
@@ -529,6 +538,10 @@ fn main() -> Result<()> {
                     match largest_ctr {
                         Some(largest_ctr) => {
                             let end_x = largest_ctr.end_x;
+                            let area = largest_ctr.area;
+
+                            // Ignore large delta changes for small areas (probably noise)
+                            let small_area = area < 5000.0;
 
                             // Don't allow last_seen_x to change by over some large delta
                             if let Some(last_seen_x) = last_seen_x {
@@ -538,8 +551,11 @@ fn main() -> Result<()> {
                                         wait_until,
                                         last_seen_x: Some(end_x),
                                     });
-                                } else {
-                                    println!("end_x changed by {}px in one frame, stopping", delta);
+                                } else if !small_area {
+                                    println!(
+                                        "end_x changed by {}px in one frame, stopping (area: {})",
+                                        delta, area
+                                    );
                                     scanner.stop(true);
                                     pause = true;
                                 }
