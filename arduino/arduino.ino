@@ -1,14 +1,9 @@
 #include <AccelStepper.h>
 
-const int RST_PIN = 3;
-const int SLP_PIN = 4;
-const int STEP_PIN = 5;
-const int DIR_PIN = 6;
+const int STEP_PIN = 4;
+const int DIR_PIN = 5;
 const int FOCUS_PIN = 9;
 const int SHUTTER_PIN = 10;
-const int MICROSTEP_PIN = 11;
-
-const int STEP_PULSE = 600;
 
 String serial_buffer = "";
 
@@ -27,20 +22,10 @@ void setup() {
   pinMode(DIR_PIN, OUTPUT);
   digitalWrite(DIR_PIN, LOW);
   
-  // (don't) enable quarter microstepping
-  digitalWrite(MICROSTEP_PIN, LOW);
-  pinMode(MICROSTEP_PIN, OUTPUT);
-  
-  pinMode(RST_PIN, OUTPUT);
-  digitalWrite(RST_PIN, HIGH);
-  
-  pinMode(SLP_PIN, OUTPUT);
-  digitalWrite(SLP_PIN, HIGH);
-  
   Serial.begin(115200);
 
-  stepper.setMaxSpeed(1400); // 1600 ~= max before motor starts missing steps
-  stepper.setAcceleration(12000);
+  stepper.setMaxSpeed(4000);
+  stepper.setAcceleration(25000);
   stepper.setPinsInverted(true);
 }
 
@@ -52,25 +37,25 @@ void loop() {
       int steps = serial_buffer.toInt();
       serial_buffer = "";
 
+      Serial.print("Moving");
+      Serial.println(steps);
+
       if (steps == 0) {
         stepper.stop();
       } else {
         stepper.move(steps);
       }
     }
+    else if (incoming_byte == 's') {
+      int speed = serial_buffer.toInt();
+      serial_buffer = "";
+      stepper.setMaxSpeed(speed);
+    }
     else if (incoming_byte == 'S') {
-      // Force motor to stop to avoid vibrations
-      //digitalWrite(SLP_PIN, LOW);
-      
       // Shutter
-      //digitalWrite(FOCUS_PIN, HIGH);
-      //delay(50);
       digitalWrite(SHUTTER_PIN, HIGH);
       delay(50);
       digitalWrite(SHUTTER_PIN, LOW);
-      //digitalWrite(FOCUS_PIN, LOW);
-
-      //digitalWrite(FOCUS_PIN, HIGH);
     }
     else if (incoming_byte == 'F') {
       digitalWrite(FOCUS_PIN, HIGH);
