@@ -1,4 +1,4 @@
-# Modular print in place 35mm film scanner
+# Modular print in place 35mm film scanner writeup
 
 I've been building a 35mm film scanner using Lego, and more recently 3D printing.
 
