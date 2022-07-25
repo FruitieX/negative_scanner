@@ -1,4 +1,4 @@
-use log::{debug, error, info, log_enabled, trace, warn, Level};
+use log::{debug, info, trace, warn};
 use opencv::{
     core::{self, Point, Scalar},
     highgui, imgproc,
@@ -531,255 +531,256 @@ fn main() -> Result<()> {
             }
         }
 
-        if !pause {
-            match state.current {
-                ScannerState::TogglingFocus {
-                    init_timestamp,
-                    step,
-                } => {
-                    if step == 0 {
-                        info!("Toggling camera focus...");
-                        scanner.focus();
-                        state.set(ScannerState::TogglingFocus {
-                            init_timestamp: Instant::now(),
-                            step: 1,
-                        });
-                    } else if step == 1 {
-                        // Wait until enough time has passed
-                        if Instant::now() < init_timestamp + Duration::from_millis(200) {
-                            continue;
-                        }
+        if pause {
+            continue;
+        }
 
-                        scanner.stop_focus();
-                        state.set(ScannerState::TogglingFocus {
-                            init_timestamp: Instant::now(),
-                            step: 2,
-                        });
-                    } else if step == 2 {
-                        // Wait until UI is hidden after focusing
-                        if Instant::now() < init_timestamp + Duration::from_millis(600) {
-                            continue;
-                        }
-                        state.set(ScannerState::default());
+        match state.current {
+            ScannerState::TogglingFocus {
+                init_timestamp,
+                step,
+            } => {
+                if step == 0 {
+                    info!("Toggling camera focus...");
+                    scanner.focus();
+                    state.set(ScannerState::TogglingFocus {
+                        init_timestamp: Instant::now(),
+                        step: 1,
+                    });
+                } else if step == 1 {
+                    // Wait until enough time has passed
+                    if Instant::now() < init_timestamp + Duration::from_millis(200) {
+                        continue;
                     }
+
+                    scanner.stop_focus();
+                    state.set(ScannerState::TogglingFocus {
+                        init_timestamp: Instant::now(),
+                        step: 2,
+                    });
+                } else if step == 2 {
+                    // Wait until UI is hidden after focusing
+                    if Instant::now() < init_timestamp + Duration::from_millis(600) {
+                        continue;
+                    }
+                    state.set(ScannerState::default());
                 }
-                ScannerState::AligningFrame {
-                    wait_until,
-                    last_seen_dist,
-                } => {
-                    match largest_ctr {
-                        Some(largest_ctr) => {
-                            // How many pixels film still needs to move according to detection
-                            let dist_to_gap_end = match FILM_MOVE_DIR {
-                                Direction::Right => cropped_width - largest_ctr.start_x,
-                                Direction::Left => largest_ctr.end_x,
-                            };
-                            let area = largest_ctr.area;
+            }
+            ScannerState::AligningFrame {
+                wait_until,
+                last_seen_dist,
+            } => {
+                match largest_ctr {
+                    Some(largest_ctr) => {
+                        // How many pixels film still needs to move according to detection
+                        let dist_to_gap_end = match FILM_MOVE_DIR {
+                            Direction::Right => cropped_width - largest_ctr.start_x,
+                            Direction::Left => largest_ctr.end_x,
+                        };
+                        let area = largest_ctr.area;
 
-                            // Ignore large delta changes for small areas (probably noise)
-                            let small_area = area < 5000.0;
+                        // Ignore large delta changes for small areas (probably noise)
+                        let small_area = area < 5000.0;
 
-                            // Don't allow last_seen_dist to change by over some large delta
-                            let large_delta = if let Some(last_seen_dist) = last_seen_dist {
-                                let delta = (last_seen_dist - dist_to_gap_end).abs();
-                                if delta < 100.0 {
-                                    state.set(ScannerState::AligningFrame {
-                                        wait_until,
-                                        last_seen_dist: Some(dist_to_gap_end),
-                                    });
-
-                                    false
-                                } else {
-                                    if !small_area {
-                                        warn!(
-                                            "dist_to_gap_end changed by {}px in one frame, stopping (area: {})",
-                                            delta, area
-                                        );
-                                    } else {
-                                        info!(
-                                            "dist_to_gap_end changed by {}px in one frame, not stopping due to small area (area: {})",
-                                            delta, area
-                                        );
-                                    }
-
-                                    true
-                                }
-                            } else {
-                                // Always update last seen x position to state
+                        // Don't allow last_seen_dist to change by over some large delta
+                        let large_delta = if let Some(last_seen_dist) = last_seen_dist {
+                            let delta = (last_seen_dist - dist_to_gap_end).abs();
+                            if delta < 100.0 {
                                 state.set(ScannerState::AligningFrame {
                                     wait_until,
                                     last_seen_dist: Some(dist_to_gap_end),
                                 });
 
                                 false
-                            };
-
-                            if large_delta && !small_area {
-                                scanner.stop(true);
-                                pause = true;
-                            }
-
-                            if large_delta {
-                                warn!("waiting if large delta goes away...");
-                                continue;
-                            }
-
-                            let detection_pos_dist = (1.0 - NEW_DETECTION_POS) * cropped_width;
-                            let moved_past_detection_point = dist_to_gap_end < detection_pos_dist;
-
-                            // Immediately stop film for more accurate measurements if frame just moved past
-                            // detection point
-                            if let Some(last_seen_dist) = last_seen_dist {
-                                let just_moved_past_detection_point = last_seen_dist
-                                    >= detection_pos_dist
-                                    && moved_past_detection_point;
-
-                                if just_moved_past_detection_point {
-                                    scanner.stop(true);
-                                    state.set(ScannerState::AligningFrame {
-                                        wait_until: Instant::now()
-                                            + Duration::from_millis(INPUT_LAG_MSEC)
-                                            + Duration::from_millis(PRE_FEED_NEW_FILM_WAIT)
-                                            + Duration::from_millis(STEPPER_ACCEL_TIME),
-                                        last_seen_dist: Some(dist_to_gap_end),
-                                    });
-
-                                    continue;
-                                }
-                            }
-
-                            // Wait some time after previous move command
-                            if Instant::now() < wait_until {
-                                continue;
-                            }
-
-                            // Frame gap found in last_ctr, move film forward
-                            // towards end of gap
-                            let steps = dist_to_gap_end * PX_PER_STEP;
-                            let steps = steps.round(); //.max(5.0);
-                            let steps = steps + EXTRA_ALIGNMENT_STEPS as f64;
-                            info!(
-                                "{} px to end of frame gap, moving motor {} steps",
-                                dist_to_gap_end, steps
-                            );
-
-                            let speed = if moved_past_detection_point {
-                                None
                             } else {
-                                Some(100)
-                            };
+                                if !small_area {
+                                    warn!(
+                                            "dist_to_gap_end changed by {}px in one frame, stopping (area: {})",
+                                            delta, area
+                                        );
+                                } else {
+                                    info!(
+                                            "dist_to_gap_end changed by {}px in one frame, not stopping due to small area (area: {})",
+                                            delta, area
+                                        );
+                                }
 
-                            match FILM_MOVE_DIR {
-                                Direction::Right => {
-                                    scanner.move_right(steps as usize, speed);
-                                }
-                                Direction::Left => {
-                                    scanner.move_left(steps as usize, speed);
-                                }
+                                true
                             }
-
-                            let step_time = MSEC_PER_1000_STEPS as f64 / 1000.0 * steps;
-                            let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
-                                + Duration::from_millis(STEPPER_ACCEL_TIME)
-                                + Duration::from_millis(STEPPER_ACCEL_TIME)
-                                + Duration::from_millis(step_time as u64);
-
-                            // Limit wait time to 1 sec
-                            let wait_time = wait_time.min(Duration::from_secs(1));
-
+                        } else {
+                            // Always update last seen x position to state
                             state.set(ScannerState::AligningFrame {
-                                wait_until: Instant::now() + wait_time,
+                                wait_until,
                                 last_seen_dist: Some(dist_to_gap_end),
-                            })
+                            });
+
+                            false
+                        };
+
+                        if large_delta && !small_area {
+                            scanner.stop(true);
+                            pause = true;
                         }
-                        None => {
-                            // Wait some time after previous move command
-                            if Instant::now() < wait_until {
+
+                        if large_delta {
+                            warn!("waiting if large delta goes away...");
+                            continue;
+                        }
+
+                        let detection_pos_dist = (1.0 - NEW_DETECTION_POS) * cropped_width;
+                        let moved_past_detection_point = dist_to_gap_end < detection_pos_dist;
+
+                        // Immediately stop film for more accurate measurements if frame just moved past
+                        // detection point
+                        if let Some(last_seen_dist) = last_seen_dist {
+                            let just_moved_past_detection_point =
+                                last_seen_dist >= detection_pos_dist && moved_past_detection_point;
+
+                            if just_moved_past_detection_point {
+                                scanner.stop(true);
+                                state.set(ScannerState::AligningFrame {
+                                    wait_until: Instant::now()
+                                        + Duration::from_millis(INPUT_LAG_MSEC)
+                                        + Duration::from_millis(PRE_FEED_NEW_FILM_WAIT)
+                                        + Duration::from_millis(STEPPER_ACCEL_TIME),
+                                    last_seen_dist: Some(dist_to_gap_end),
+                                });
+
                                 continue;
                             }
-
-                            // Could not find frame gaps, assume frame is
-                            // aligned and take photo
-
-                            info!("No frame gaps in feed, stopping motor and taking photo");
-                            scanner.stop(true);
-                            let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
-                                + Duration::from_millis(PRE_SHUTTER_WAIT_MSEC)
-                                + Duration::from_millis(STEPPER_ACCEL_TIME);
-
-                            state.set(ScannerState::TakingPhoto {
-                                wait_until: Instant::now() + wait_time,
-                            })
                         }
-                    }
-                }
-                ScannerState::TakingPhoto { wait_until } => {
-                    // Wait until enough time has passed so that the film has come to a stop
-                    if Instant::now() < wait_until {
-                        continue;
-                    }
 
-                    scanner.take_photo();
-                    scanner.stop_focus();
+                        // Wait some time after previous move command
+                        if Instant::now() < wait_until {
+                            continue;
+                        }
 
-                    state.set(ScannerState::WaitingForShutterClose);
-                }
-                ScannerState::WaitingForShutterClose => {
-                    // Crude detection of when shutter black-out starts - wait
-                    // until we see less than 2000 non zero pixels (Fujifilm
-                    // X-T200 UI draws around 1000 non zero pixels during
-                    // shutter black-out)
-                    let non_zero_px = core::count_non_zero(&frame_bw)?;
-                    // TODO: magic numbers
-                    if non_zero_px <= 2000 {
-                        state.set(ScannerState::WaitingForShutterOpen);
-                    } else {
-                        info!("Waiting for start of shutter black-out")
-                    }
-                }
-                ScannerState::WaitingForShutterOpen => {
-                    // Crude detection of when shutter black-out ends - wait
-                    // until we see more than 2000 non zero pixels (Fujifilm
-                    // X-T200 UI draws around 1000 non zero pixels during
-                    // shutter black-out)
-                    let non_zero_px = core::count_non_zero(&frame_bw)?;
-                    // TODO: magic numbers
-                    if non_zero_px > 2000 {
-                        info!("Moving film to next frame");
+                        // Frame gap found in last_ctr, move film forward
+                        // towards end of gap
+                        let steps = dist_to_gap_end * PX_PER_STEP;
+                        let steps = steps.round(); //.max(5.0);
+                        let steps = steps + EXTRA_ALIGNMENT_STEPS as f64;
+                        info!(
+                            "{} px to end of frame gap, moving motor {} steps",
+                            dist_to_gap_end, steps
+                        );
 
-                        // Move enough forward so that we start detecting the next frame
+                        let speed = if moved_past_detection_point {
+                            None
+                        } else {
+                            Some(100)
+                        };
+
                         match FILM_MOVE_DIR {
                             Direction::Right => {
-                                scanner.move_right(NEXT_FRAME_SKIP_STEPS, None);
+                                scanner.move_right(steps as usize, speed);
                             }
                             Direction::Left => {
-                                scanner.move_left(NEXT_FRAME_SKIP_STEPS, None);
+                                scanner.move_left(steps as usize, speed);
                             }
                         }
 
-                        let step_time =
-                            MSEC_PER_1000_STEPS as f64 / 1000.0 * NEXT_FRAME_SKIP_STEPS as f64;
-
+                        let step_time = MSEC_PER_1000_STEPS as f64 / 1000.0 * steps;
                         let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
+                            + Duration::from_millis(STEPPER_ACCEL_TIME)
                             + Duration::from_millis(STEPPER_ACCEL_TIME)
                             + Duration::from_millis(step_time as u64);
 
-                        state.set(ScannerState::SkipToNextFrame {
+                        // Limit wait time to 1 sec
+                        let wait_time = wait_time.min(Duration::from_secs(1));
+
+                        state.set(ScannerState::AligningFrame {
                             wait_until: Instant::now() + wait_time,
-                        });
-                    } else {
-                        info!("Waiting for end of shutter black-out")
+                            last_seen_dist: Some(dist_to_gap_end),
+                        })
+                    }
+                    None => {
+                        // Wait some time after previous move command
+                        if Instant::now() < wait_until {
+                            continue;
+                        }
+
+                        // Could not find frame gaps, assume frame is
+                        // aligned and take photo
+
+                        info!("No frame gaps in feed, stopping motor and taking photo");
+                        scanner.stop(true);
+                        let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
+                            + Duration::from_millis(PRE_SHUTTER_WAIT_MSEC)
+                            + Duration::from_millis(STEPPER_ACCEL_TIME);
+
+                        state.set(ScannerState::TakingPhoto {
+                            wait_until: Instant::now() + wait_time,
+                        })
                     }
                 }
+            }
+            ScannerState::TakingPhoto { wait_until } => {
+                // Wait until enough time has passed so that the film has come to a stop
+                if Instant::now() < wait_until {
+                    continue;
+                }
 
-                ScannerState::SkipToNextFrame { wait_until } => {
-                    // Wait until enough time has passed so that the film has moved far enough
-                    if Instant::now() < wait_until {
-                        continue;
+                scanner.take_photo();
+                scanner.stop_focus();
+
+                state.set(ScannerState::WaitingForShutterClose);
+            }
+            ScannerState::WaitingForShutterClose => {
+                // Crude detection of when shutter black-out starts - wait
+                // until we see less than 2000 non zero pixels (Fujifilm
+                // X-T200 UI draws around 1000 non zero pixels during
+                // shutter black-out)
+                let non_zero_px = core::count_non_zero(&frame_bw)?;
+                // TODO: magic numbers
+                if non_zero_px <= 2000 {
+                    state.set(ScannerState::WaitingForShutterOpen);
+                } else {
+                    info!("Waiting for start of shutter black-out")
+                }
+            }
+            ScannerState::WaitingForShutterOpen => {
+                // Crude detection of when shutter black-out ends - wait
+                // until we see more than 2000 non zero pixels (Fujifilm
+                // X-T200 UI draws around 1000 non zero pixels during
+                // shutter black-out)
+                let non_zero_px = core::count_non_zero(&frame_bw)?;
+                // TODO: magic numbers
+                if non_zero_px > 2000 {
+                    info!("Moving film to next frame");
+
+                    // Move enough forward so that we start detecting the next frame
+                    match FILM_MOVE_DIR {
+                        Direction::Right => {
+                            scanner.move_right(NEXT_FRAME_SKIP_STEPS, None);
+                        }
+                        Direction::Left => {
+                            scanner.move_left(NEXT_FRAME_SKIP_STEPS, None);
+                        }
                     }
 
-                    state.set(ScannerState::default());
+                    let step_time =
+                        MSEC_PER_1000_STEPS as f64 / 1000.0 * NEXT_FRAME_SKIP_STEPS as f64;
+
+                    let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
+                        + Duration::from_millis(STEPPER_ACCEL_TIME)
+                        + Duration::from_millis(step_time as u64);
+
+                    state.set(ScannerState::SkipToNextFrame {
+                        wait_until: Instant::now() + wait_time,
+                    });
+                } else {
+                    info!("Waiting for end of shutter black-out")
                 }
+            }
+
+            ScannerState::SkipToNextFrame { wait_until } => {
+                // Wait until enough time has passed so that the film has moved far enough
+                if Instant::now() < wait_until {
+                    continue;
+                }
+
+                state.set(ScannerState::default());
             }
         }
     }
