@@ -27,6 +27,8 @@ breadboards, jumper wires, resistors, LEDs (optional)
 
 Start by wiring up the following schematic:
 
+![negative_scanner_bb](https://user-images.githubusercontent.com/3673134/180787356-b0ec154f-f14b-488b-8146-9200ffeec2b2.png)
+
 Next flash your Arduino with the provided sketch. You can test that everything works by
 opening up the serial monitor, setting baud rate to 115200 and writing commands like:
 
