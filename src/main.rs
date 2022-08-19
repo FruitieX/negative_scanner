@@ -1,12 +1,16 @@
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace};
 use opencv::{
-    core::{self, Point, Scalar},
-    highgui, imgproc,
+    core::{self, min_max_loc, Point, Scalar},
+    highgui,
+    imgproc::{self, INTER_LINEAR},
     prelude::*,
     types::VectorOfMat,
     videoio, Result,
 };
+use rodio::{source::Source, Decoder, OutputStream, OutputStreamHandle};
 use serialport::SerialPort;
+use std::fs::File;
+use std::io::BufReader;
 use std::time::{Duration, Instant};
 
 #[derive(PartialEq)]
@@ -27,48 +31,60 @@ const MAX_SPEED: usize = 10000;
 /// or in the scanner itself. I'm also using a horizontal crop because my
 /// camera has a 16:9 HDMI output but the sensor is 3:2.
 const DETECTION_HORIZONTAL_CROP: f64 = (3.0 / 2.0) / (16.0 / 9.0);
-const DETECTION_VERTICAL_CROP: f64 = 0.95;
+const DETECTION_VERTICAL_CROP: f64 = 0.90;
 
 /// How many pixels one step corresponds to
-const PX_PER_STEP: f64 = 1.85;
+const PX_PER_STEP: f64 = 1.7;
 
 /// How many steps are lost when transitioning from
 /// forward movement to backward movement due to slop
 /// between the gear and film sprockets.
 const SLOP_STEPS: usize = 20;
 
-/// Always step this many extra steps when aligning frame
+/// Always step this many extra steps when aligning frame, tries to ensure
+/// that the leading edge of the frame never ends up visible.
 const EXTRA_ALIGNMENT_STEPS: usize = 10;
 
-/// Extra time to wait before taking photo. Helps avoids vibrations during
-/// exposure.
-const PRE_SHUTTER_WAIT_MSEC: u64 = 100;
+/// Extra time to wait before running detection after a move command. Helps
+/// avoid motion blur, and gives camera some time to adjust auto exposure.
+const PRE_DETECTION_WAIT_MSEC: u64 = 200;
 
+/// Gives my sausage fingers some time to detach themselves from the film
 const PRE_FEED_NEW_FILM_WAIT: u64 = 500;
 
 /// Account for camera video feed -> opencv input lag
-const INPUT_LAG_MSEC: u64 = 300;
+const INPUT_LAG_MSEC: u64 = 200;
 
 /// How many milliseconds it takes to move the film 1000 steps
-const MSEC_PER_1000_STEPS: u64 = 700;
+const MSEC_PER_1000_STEPS: u64 = 400;
 
 /// Time it takes for stepper motor to (de)accelerate between zero and max
 /// speed (maxSpeed / acceleration)
-const STEPPER_ACCEL_TIME: u64 = 120;
+const STEPPER_ACCEL_TIME: u64 = 0;
 
-/// How many steps to move the film forward after taking a photo
-const NEXT_FRAME_SKIP_STEPS: usize = 975;
+/// How many steps to move the film forward after taking a photo.
+const NEXT_FRAME_SKIP_STEPS: usize = 985;
+
+/// Slow film down for easier feeding when frame moves past this point (in
+/// percentage of width). Film is slowed down until DETECTION_POS
+const FEED_SLOW_POS: f64 = 0.00;
 
 /// Stop film for more accurate position measurements when frame moves past this
 /// point (in percentage of width)
-const NEW_DETECTION_POS: f64 = 0.55;
+const DETECTION_POS: f64 = 0.55;
+
+/// End of roll detection when
+const END_OF_ROLL_DETECTION_POS: f64 = 0.4;
+
+/// Don't take photos if this is true.
+const DRY_RUN: bool = false;
 
 #[derive(Debug)]
 struct State {
     current: ScannerState,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum ScannerState {
     TogglingFocus {
         init_timestamp: Instant,
@@ -77,6 +93,7 @@ enum ScannerState {
     AligningFrame {
         wait_until: Instant,
         last_seen_dist: Option<f64>,
+        end_of_roll: bool,
     },
     TakingPhoto {
         wait_until: Instant,
@@ -93,6 +110,7 @@ impl Default for ScannerState {
         ScannerState::AligningFrame {
             wait_until: Instant::now(),
             last_seen_dist: None,
+            end_of_roll: false,
         }
     }
 }
@@ -106,11 +124,14 @@ impl State {
     }
 
     pub fn set(&mut self, new: ScannerState) {
-        debug!("Entering state: {:?}", new);
+        if self.current != new {
+            trace!("Entering state: {:?}", new);
+        }
         self.current = new;
     }
 }
 
+#[derive(Clone, Debug)]
 struct Contour {
     contour: Mat,
     area: f64,
@@ -121,6 +142,7 @@ struct Contour {
 struct Scanner {
     tx: std::sync::mpsc::Sender<String>,
     prev_dir: Option<Direction>,
+    prev_cmd_was_stop: bool,
 }
 
 impl Scanner {
@@ -131,7 +153,7 @@ impl Scanner {
             let msg = rx.recv();
 
             if let Ok(msg) = msg {
-                debug!("Writing to serial: {}", msg);
+                trace!("Writing to serial: {}", msg);
                 let bytes: &[u8] = msg.as_bytes();
                 trace!("Bytes: {:?}", bytes);
                 port.write_all(bytes)
@@ -139,7 +161,11 @@ impl Scanner {
             }
         });
 
-        Scanner { tx, prev_dir: None }
+        Scanner {
+            tx,
+            prev_dir: None,
+            prev_cmd_was_stop: false,
+        }
     }
 
     pub fn set_speed(&mut self, speed: Option<usize>) {
@@ -157,6 +183,7 @@ impl Scanner {
         self.set_speed(speed);
         self.write(&format!("{}M", steps));
         self.prev_dir = Some(Direction::Right);
+        self.prev_cmd_was_stop = false;
     }
 
     pub fn move_left(&mut self, mut steps: usize, speed: Option<usize>) {
@@ -166,6 +193,7 @@ impl Scanner {
         self.set_speed(speed);
         self.write(&format!("-{}M", steps));
         self.prev_dir = Some(Direction::Left);
+        self.prev_cmd_was_stop = false;
     }
 
     pub fn stop(&mut self, silent: bool) {
@@ -175,6 +203,12 @@ impl Scanner {
 
         self.write("0M");
 
+        // Skip slop removal if previous cmd was stop
+        if self.prev_cmd_was_stop {
+            return;
+        }
+
+        // Remove slop from gears
         match self.prev_dir {
             Some(Direction::Right) => {
                 self.move_left(0, None);
@@ -184,6 +218,8 @@ impl Scanner {
             }
             _ => {}
         }
+
+        self.prev_cmd_was_stop = true;
     }
 
     pub fn take_photo(&mut self) {
@@ -205,46 +241,129 @@ impl Scanner {
     }
 }
 
-/// Checks whether frame contains any columns with all white pixels
-fn has_full_cols(mat: &Mat) -> Result<bool> {
-    // Try finding vertical line that spans from top to bottom:
-    let vec2d: Vec<Vec<u8>> = mat.to_vec_2d()?;
-    let width = mat.cols() as usize;
-
-    // Iterate over columns
-    for x in 0..width {
-        // Look for white pixels on each row
-        let full_col = vec2d.iter().all(|row| row[x] > 0);
-
-        if full_col {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+struct ColStats {
+    col_mean: Mat,
+    col_std_dev: Mat,
+    col_diffs: Mat,
 }
 
-/// Masks out any columns that don't contain all white pixels
-fn mask_non_full_cols(mat: &Mat) -> Result<Mat> {
-    // Try finding vertical line that spans from top to bottom:
-    let mut vec2d: Vec<Vec<u8>> = mat.to_vec_2d()?;
-    let width = mat.cols() as usize;
+/// Computes mean values, standard deviation, min and max pixel values within
+/// each column.
+fn get_col_stats(mat: &Mat) -> Result<ColStats> {
+    let mut mean_value = Mat::default();
+    let mut std_value = Mat::default();
 
-    // Iterate over columns
-    for x in 0..width {
-        // Look for white pixels on each row
-        let full_col = vec2d.iter().all(|row| row[x] > 0);
+    let mut col_mean = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
+    let mut col_std_dev = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
+    let mut col_diffs = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
 
-        if !full_col {
-            vec2d.iter_mut().for_each(|row| row[x] = 0);
+    let mut mat_bw = Mat::default();
+    imgproc::cvt_color(&mat, &mut mat_bw, imgproc::COLOR_RGB2GRAY, 0)?;
+
+    for i in 0..mat.cols() {
+        opencv::core::mean_std_dev(
+            &mat.col(i)?,
+            &mut mean_value,
+            &mut std_value,
+            &Mat::default(),
+        )?;
+
+        {
+            let col_mean: &mut f64 = col_mean.at_mut(i)?;
+            let vec: Vec<Vec<f64>> = mean_value.to_vec_2d()?;
+            let sum: f64 = vec.iter().flatten().sum();
+            let sum = sum / 255.0 / 3.0;
+            *col_mean = sum;
+        }
+
+        {
+            let col_std_dev: &mut f64 = col_std_dev.at_mut(i)?;
+            let vec: Vec<Vec<f64>> = std_value.to_vec_2d()?;
+            let sum: f64 = vec.iter().flatten().sum();
+            let sum = sum / 255.0;
+            *col_std_dev = sum;
+        }
+
+        // Min / max values
+        {
+            let mut min_val = Some(0.0);
+            let mut max_val = Some(0.0);
+
+            min_max_loc(
+                &mat_bw.col(i)?,
+                min_val.as_mut(),
+                max_val.as_mut(),
+                None,
+                None,
+                &Mat::default(),
+            )?;
+
+            let col_diff: &mut f64 = col_diffs.at_mut(i)?;
+            *col_diff = (max_val.unwrap() - min_val.unwrap()) / 255.0;
         }
     }
 
-    Mat::from_slice_2d(&vec2d)
+    Ok(ColStats {
+        col_mean,
+        col_std_dev,
+        col_diffs,
+    })
+}
+
+fn dbg_col(mat: &Mat, winname: &str) -> Result<()> {
+    let mut mat_show = mat.clone();
+    core::transpose(&mat_show.clone(), &mut mat_show)?;
+    core::flip(&mat_show.clone(), &mut mat_show, 0)?;
+    imgproc::resize(
+        &mat_show.clone(),
+        &mut mat_show,
+        core::Size_::new(540, 480),
+        0.0,
+        0.0,
+        INTER_LINEAR,
+    )?;
+    highgui::imshow(winname, &mat_show)?;
+
+    Ok(())
+}
+
+struct Audio {
+    // If we drop the stream variable, we won't be able to play any sounds.
+    #[allow(dead_code)]
+    stream: OutputStream,
+    stream_handle: OutputStreamHandle,
+}
+
+impl Audio {
+    fn new() -> Audio {
+        // Get a output stream handle to the default physical sound device
+        let (stream, stream_handle) = OutputStream::try_default().unwrap();
+
+        Audio {
+            stream,
+            stream_handle,
+        }
+    }
+
+    fn play_sound(&self, filename: &str) {
+        let filename = String::from(filename);
+
+        // Load a sound from a file, using a path relative to Cargo.toml
+        let file = BufReader::new(File::open(filename).unwrap());
+
+        // Decode that sound file into a source
+        let source = Decoder::new(file).unwrap();
+
+        // Play the sound directly on the device
+        self.stream_handle
+            .play_raw(source.convert_samples())
+            .unwrap();
+    }
 }
 
 fn main() -> Result<()> {
     env_logger::init();
+    let audio = Audio::new();
 
     let port_infos = serialport::available_ports().expect("No serial ports found");
     let port_info = port_infos.first().expect("No serial ports found");
@@ -287,10 +406,10 @@ fn main() -> Result<()> {
         // Capture next frame
         cam.read(&mut frame)?;
 
-        let cropped_width = frame_width * DETECTION_HORIZONTAL_CROP;
-        let cropped_x = (frame_width - cropped_width) / 2.0;
-        let cropped_height = frame_height * DETECTION_VERTICAL_CROP;
-        let cropped_y = (frame_height - cropped_height) / 2.0;
+        let cropped_width = (frame_width * DETECTION_HORIZONTAL_CROP).floor() - 4.0;
+        let cropped_x = ((frame_width - cropped_width) / 2.0).floor() + 2.0;
+        let cropped_height = (frame_height * DETECTION_VERTICAL_CROP).floor();
+        let cropped_y = ((frame_height - cropped_height) / 2.0).floor();
 
         // Make sure we don't crop outside image (crashes opencv)
         let cropped_x = cropped_x.min(frame_width - cropped_width);
@@ -307,98 +426,113 @@ fn main() -> Result<()> {
 
         // Apply median blur to get rid of small scratches / noise
         let mut frame_blurred = Mat::default();
-        imgproc::median_blur(&frame_cropped, &mut frame_blurred, 7 * 2 + 1)?;
+        imgproc::median_blur(&frame_cropped, &mut frame_blurred, 2 * 2 + 1)?;
         // highgui::imshow("frame_blurred", &frame_blurred)?;
+
+        let ColStats {
+            col_mean,
+            col_std_dev,
+            col_diffs,
+            ..
+        } = get_col_stats(&frame_blurred)?;
+
+        // dbg!(format!(
+        //     "{:?}",
+        //     &col_mean
+        //         .to_vec_2d::<f64>()
+        //         .into_iter()
+        //         .flatten()
+        //         .flatten()
+        //         .map(|x| (x * 255.0).round() as i32)
+        //         .collect::<Vec<i32>>()
+        // ));
+
+        // Only used for debugging
+        {
+            dbg_col(&col_std_dev, "col_std_dev")?;
+            dbg_col(&col_mean, "col_mean")?;
+            dbg_col(&col_diffs, "col_diffs")?;
+        }
+
+        // Find darkest and brightest column mean values
+        // TODO: should maybe use col_mins and col_maxs?
+        let (_col_mean_darkest, col_mean_brightest) = {
+            let mut min_val = Some(0.0);
+            let mut max_val = Some(0.0);
+            min_max_loc(
+                &col_mean,
+                min_val.as_mut(),
+                max_val.as_mut(),
+                None,
+                None,
+                &Mat::default(),
+            )?;
+
+            (min_val.unwrap(), max_val.unwrap())
+        };
+        // dbg!(col_mean_brightest, col_mean_darkest);
+
+        let col_mean_thr_val = col_mean_brightest * 0.8;
+        let col_mean_thr_val = col_mean_thr_val * 255.0;
+
+        let mut col_mean_thr = Mat::default();
+        col_mean.convert_to(&mut col_mean_thr, core::CV_8U, 255.0, 0.0)?;
+        imgproc::threshold(
+            &col_mean_thr.clone(),
+            &mut col_mean_thr,
+            col_mean_thr_val,
+            255.0,
+            imgproc::THRESH_BINARY,
+        )?;
+        dbg_col(&col_mean_thr, "col_mean_thr")?;
+
+        let mut col_std_dev_thr = Mat::default();
+        col_std_dev.convert_to(&mut col_std_dev_thr, core::CV_8U, 255.0, 0.0)?;
+        imgproc::threshold(
+            &col_std_dev_thr.clone(),
+            &mut col_std_dev_thr,
+            20.0,
+            255.0,
+            imgproc::THRESH_BINARY_INV,
+        )?;
+        dbg_col(&col_std_dev_thr, "col_std_dev_thr")?;
+
+        let mut col_diffs_thr = Mat::default();
+        col_diffs.convert_to(&mut col_diffs_thr, core::CV_8U, 255.0, 0.0)?;
+        imgproc::threshold(
+            &col_diffs_thr.clone(),
+            &mut col_diffs_thr,
+            50.0,
+            255.0,
+            imgproc::THRESH_BINARY_INV,
+        )?;
+        dbg_col(&col_diffs_thr, "col_diffs_thr")?;
+
+        let mut mask = Mat::default();
+        core::bitwise_and(&col_mean_thr, &col_std_dev_thr, &mut mask, &Mat::default())?;
+        core::bitwise_and(&mask.clone(), &col_diffs_thr, &mut mask, &Mat::default())?;
+        dbg_col(&mask, "mask")?;
 
         // Convert frame to grayscale
         let mut frame_bw = Mat::default();
         imgproc::cvt_color(&frame_blurred, &mut frame_bw, imgproc::COLOR_RGB2GRAY, 0)?;
         highgui::imshow("frame_bw", &frame_bw)?;
 
-        // Try finding a threshold value that results in at least one column
-        // full of white pixels
-        let mut test_thr = 255.0;
-        let mut frame_bw_thr = Mat::default();
-        let mut found_full_col = false;
-        // TODO: magic numbers
-        while test_thr > 120.0 {
-            imgproc::threshold(
-                &frame_bw,
-                &mut frame_bw_thr,
-                test_thr,
-                255.0,
-                imgproc::THRESH_BINARY,
-            )?;
-
-            if has_full_cols(&frame_bw_thr)? {
-                found_full_col = true;
-                break;
-            }
-
-            test_thr -= 20.0;
-        }
-
-        if found_full_col {
-            // Perform thresholding once more with slightly smaller thresh value (the goal is to detect
-            // the entire frame gap rather than just the possibly one pixel wide gap)
-            imgproc::threshold(
-                &frame_bw,
-                &mut frame_bw_thr,
-                // TODO: magic numbers
-                test_thr - 10.0,
-                255.0,
-                imgproc::THRESH_BINARY,
-            )?;
-        }
-
-        // Mask out columns with pixels below the threshold
-        highgui::imshow("pre_mask", &frame_bw_thr)?;
-        let frame_bw_thr = mask_non_full_cols(&frame_bw_thr)?;
-        highgui::imshow("frame_bw_thr", &frame_bw_thr)?;
-
-        // Perform adaptive thresholding on the grayscale image to mask out any
-        // parts with sharp edges.
-        let mut adaptive_thr = Mat::default();
-        imgproc::adaptive_threshold(
-            &frame_bw,
-            &mut adaptive_thr,
-            255.0,
-            imgproc::ADAPTIVE_THRESH_GAUSSIAN_C,
-            imgproc::THRESH_BINARY,
-            11 * 2 + 1,
-            2.into(),
+        // Find contours of mask
+        core::transpose(&mask.clone(), &mut mask)?;
+        core::flip(&mask.clone(), &mut mask, 0)?;
+        imgproc::resize(
+            &mask.clone(),
+            &mut mask,
+            core::Size_::new(cropped_width as i32, cropped_height as i32),
+            0.0,
+            0.0,
+            INTER_LINEAR,
         )?;
 
-        // Perform noise reduction on the adaptive thresholding result
-        let sizes = vec![3, 3].into_iter().collect();
-        let kernel = Mat::new_nd_vec_with_default(&sizes, 0, Scalar::from(255.0))?;
-        let anchor = Point::new(-1, -1);
-        imgproc::morphology_ex(
-            &adaptive_thr.clone(),
-            &mut adaptive_thr,
-            imgproc::MORPH_CLOSE,
-            &kernel,
-            anchor,
-            1,
-            opencv::core::BORDER_CONSTANT,
-            imgproc::morphology_default_border_value()?,
-        )?;
-        highgui::imshow("pre_mask_adaptive", &adaptive_thr)?;
-
-        // Mask out columns with pixels below the threshold
-        let adaptive_thr = mask_non_full_cols(&adaptive_thr)?;
-        // highgui::imshow("adaptive_thr", &adaptive_thr)?;
-
-        // Assume that gaps between negative frames exist in areas where both
-        // methods of thresholding passed.
-        let mut gaps = Mat::default();
-        core::bitwise_and(&adaptive_thr, &frame_bw_thr, &mut gaps, &Mat::default())?;
-        highgui::imshow("gaps", &gaps)?;
-
-        // Find contours of gaps mask
         let mut contours = VectorOfMat::new();
         imgproc::find_contours(
-            &gaps,
+            &mask,
             &mut contours,
             imgproc::RETR_TREE,
             imgproc::CHAIN_APPROX_SIMPLE,
@@ -426,11 +560,11 @@ fn main() -> Result<()> {
             .filter(|ctr| ctr.area > 0.0)
             // Filter out small areas unless they are at the left or right of the frame
             // (These edges are critical to get the alignment of the film just right)
-            .filter(|ctr| {
-                // TODO: magic numbers
-                (ctr.start_x <= 10.0 || ctr.end_x >= cropped_width as f64 - 10.0)
-                    || ctr.area > 5000.0
-            })
+            // .filter(|ctr| {
+            //     // TODO: magic numbers
+            //     (ctr.start_x <= 10.0 || ctr.end_x >= cropped_width as f64 - 10.0)
+            //         || ctr.area > 5000.0
+            // })
             .collect();
 
         let filtered_contours: VectorOfMat = ctrs.iter().map(|ctr| ctr.contour.clone()).collect();
@@ -443,22 +577,50 @@ fn main() -> Result<()> {
             imgproc::LINE_8,
             &core::no_array(),
             i32::MAX,
-            Point::new(
-                cropped_x as i32,
-                cropped_y as i32
-                    + ((cropped_height / 2.0 - frame_bw_thr.rows() as f64 / 2.0) as i32),
-            ),
+            Point::new(cropped_x as i32, cropped_y as i32),
         )?;
 
         ctrs.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
-        let largest_ctr = ctrs.iter().last();
+        let largest_ctr = ctrs.iter().last().cloned();
 
-        // ctrs.sort_by(|a, b| a.end_x.partial_cmp(&b.end_x).unwrap());
-        // let last_ctr = ctrs.first();
+        ctrs.sort_by(|a, b| a.end_x.partial_cmp(&b.end_x).unwrap());
+        let next_ctr = match FILM_MOVE_DIR {
+            Direction::Right => ctrs.last(),
+            Direction::Left => ctrs.first(),
+        };
+
+        let edge_ctr = match FILM_MOVE_DIR {
+            Direction::Right => next_ctr.map(|ctr| {
+                if ctr.end_x >= cropped_width {
+                    Some(ctr)
+                } else {
+                    None
+                }
+            }),
+            Direction::Left => {
+                next_ctr.map(|ctr| if ctr.start_x <= 0.0 { Some(ctr) } else { None })
+            }
+        }
+        .flatten();
+
+        // dbg!(&edge_ctr);
 
         let mut frame_inv = Mat::default();
         core::bitwise_not(&frame, &mut frame_inv, &core::no_array())?;
         highgui::imshow("frame", &frame_inv)?;
+
+        // How many pixels film still needs to move according to detection
+        let dist_to_next_gap_end = match (next_ctr, FILM_MOVE_DIR) {
+            (Some(next_ctr), Direction::Right) => Some(cropped_width - next_ctr.start_x),
+            (Some(next_ctr), Direction::Left) => Some(next_ctr.end_x),
+            _ => None,
+        };
+
+        let dist_to_edge_gap_end = match (edge_ctr, FILM_MOVE_DIR) {
+            (Some(edge_ctr), Direction::Right) => Some(cropped_width - edge_ctr.start_x),
+            (Some(edge_ctr), Direction::Left) => Some(edge_ctr.end_x),
+            _ => None,
+        };
 
         // Read input from user
         let key: char = highgui::poll_key()? as u8 as char;
@@ -469,43 +631,97 @@ fn main() -> Result<()> {
 
         // Move film right
         if key == 'e' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.move_right(5, Some(200));
         }
         // FF right
         if key == '.' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.move_right(100, None);
         }
 
         // Move film left
         if key == 'a' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.move_left(5, Some(200));
         }
         // FF left
         if key == '\'' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.move_left(100, None);
         }
 
         // Shutter
         if key == 's' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.take_photo();
         }
 
         // Focus
         if key == 'f' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.focus();
         }
 
         // Stop focus
         if key == 'u' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.stop_focus();
         }
 
+        // Move to next frame
         if key == 'n' {
+            pause = true;
+            state.set(ScannerState::default());
+
             scanner.move_right(NEXT_FRAME_SKIP_STEPS, None);
+        }
+
+        // Move film 1000 steps for calibration
+        if key == 'c' {
+            pause = true;
+            state.set(ScannerState::default());
+
+            scanner.move_right(1000, None);
+        }
+
+        // Move to next gap
+        if key == 'g' {
+            pause = true;
+            state.set(ScannerState::default());
+
+            if let Some(dist_to_next_gap_end) = dist_to_next_gap_end {
+                let steps = dist_to_next_gap_end * PX_PER_STEP;
+                let steps = steps.round(); //.max(5.0);
+                let steps = steps + EXTRA_ALIGNMENT_STEPS as f64;
+                match FILM_MOVE_DIR {
+                    Direction::Right => {
+                        scanner.move_right(steps as usize, None);
+                    }
+                    Direction::Left => {
+                        scanner.move_left(steps as usize, None);
+                    }
+                }
+            }
         }
 
         // Reset
         if key == 'r' {
+            pause = true;
             state.set(ScannerState::default());
         }
 
@@ -569,66 +785,14 @@ fn main() -> Result<()> {
             ScannerState::AligningFrame {
                 wait_until,
                 last_seen_dist,
+                end_of_roll,
             } => {
-                match largest_ctr {
-                    Some(largest_ctr) => {
-                        // How many pixels film still needs to move according to detection
-                        let dist_to_gap_end = match FILM_MOVE_DIR {
-                            Direction::Right => cropped_width - largest_ctr.start_x,
-                            Direction::Left => largest_ctr.end_x,
-                        };
-                        let area = largest_ctr.area;
+                match dist_to_edge_gap_end {
+                    Some(dist_to_edge_gap_end) => {
+                        let dist_from_start = cropped_width - dist_to_edge_gap_end;
 
-                        // Ignore large delta changes for small areas (probably noise)
-                        let small_area = area < 5000.0;
-
-                        // Don't allow last_seen_dist to change by over some large delta
-                        let large_delta = if let Some(last_seen_dist) = last_seen_dist {
-                            let delta = (last_seen_dist - dist_to_gap_end).abs();
-                            if delta < 100.0 {
-                                state.set(ScannerState::AligningFrame {
-                                    wait_until,
-                                    last_seen_dist: Some(dist_to_gap_end),
-                                });
-
-                                false
-                            } else {
-                                if !small_area {
-                                    warn!(
-                                            "dist_to_gap_end changed by {}px in one frame, stopping (area: {})",
-                                            delta, area
-                                        );
-                                } else {
-                                    info!(
-                                            "dist_to_gap_end changed by {}px in one frame, not stopping due to small area (area: {})",
-                                            delta, area
-                                        );
-                                }
-
-                                true
-                            }
-                        } else {
-                            // Always update last seen x position to state
-                            state.set(ScannerState::AligningFrame {
-                                wait_until,
-                                last_seen_dist: Some(dist_to_gap_end),
-                            });
-
-                            false
-                        };
-
-                        if large_delta && !small_area {
-                            scanner.stop(true);
-                            pause = true;
-                        }
-
-                        if large_delta {
-                            warn!("waiting if large delta goes away...");
-                            continue;
-                        }
-
-                        let detection_pos_dist = (1.0 - NEW_DETECTION_POS) * cropped_width;
-                        let moved_past_detection_point = dist_to_gap_end < detection_pos_dist;
+                        let detection_pos_dist = (1.0 - DETECTION_POS) * cropped_width;
+                        let moved_past_detection_point = dist_to_edge_gap_end < detection_pos_dist;
 
                         // Immediately stop film for more accurate measurements if frame just moved past
                         // detection point
@@ -637,13 +801,16 @@ fn main() -> Result<()> {
                                 last_seen_dist >= detection_pos_dist && moved_past_detection_point;
 
                             if just_moved_past_detection_point {
+                                debug!("Stopping film for more accurate position measurement");
+                                audio.play_sound("film_feed.wav");
                                 scanner.stop(true);
                                 state.set(ScannerState::AligningFrame {
                                     wait_until: Instant::now()
                                         + Duration::from_millis(INPUT_LAG_MSEC)
                                         + Duration::from_millis(PRE_FEED_NEW_FILM_WAIT)
                                         + Duration::from_millis(STEPPER_ACCEL_TIME),
-                                    last_seen_dist: Some(dist_to_gap_end),
+                                    last_seen_dist: Some(dist_to_edge_gap_end),
+                                    end_of_roll: false,
                                 });
 
                                 continue;
@@ -657,19 +824,17 @@ fn main() -> Result<()> {
 
                         // Frame gap found in last_ctr, move film forward
                         // towards end of gap
-                        let steps = dist_to_gap_end * PX_PER_STEP;
+                        let steps = dist_to_edge_gap_end * PX_PER_STEP;
                         let steps = steps.round(); //.max(5.0);
                         let steps = steps + EXTRA_ALIGNMENT_STEPS as f64;
                         info!(
                             "{} px to end of frame gap, moving motor {} steps",
-                            dist_to_gap_end, steps
+                            dist_to_edge_gap_end, steps
                         );
 
-                        let speed = if moved_past_detection_point {
-                            None
-                        } else {
-                            Some(100)
-                        };
+                        let slow_mode = dist_from_start / cropped_width >= FEED_SLOW_POS
+                            && dist_from_start / cropped_width < DETECTION_POS;
+                        let speed = if slow_mode { Some(500) } else { None };
 
                         match FILM_MOVE_DIR {
                             Direction::Right => {
@@ -680,18 +845,24 @@ fn main() -> Result<()> {
                             }
                         }
 
+                        if dist_to_edge_gap_end < cropped_width / 2.0 {
+                            audio.play_sound("film_advance.wav");
+                        }
+
                         let step_time = MSEC_PER_1000_STEPS as f64 / 1000.0 * steps;
                         let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
                             + Duration::from_millis(STEPPER_ACCEL_TIME)
                             + Duration::from_millis(STEPPER_ACCEL_TIME)
+                            + Duration::from_millis(PRE_DETECTION_WAIT_MSEC)
                             + Duration::from_millis(step_time as u64);
 
                         // Limit wait time to 1 sec
-                        let wait_time = wait_time.min(Duration::from_secs(1));
+                        // let wait_time = wait_time.min(Duration::from_secs(1));
 
                         state.set(ScannerState::AligningFrame {
                             wait_until: Instant::now() + wait_time,
-                            last_seen_dist: Some(dist_to_gap_end),
+                            last_seen_dist: Some(dist_to_edge_gap_end),
+                            end_of_roll: false,
                         })
                     }
                     None => {
@@ -700,17 +871,52 @@ fn main() -> Result<()> {
                             continue;
                         }
 
+                        if let Some(largest_ctr) = largest_ctr {
+                            let gap_at_start = match FILM_MOVE_DIR {
+                                Direction::Right => largest_ctr.start_x <= 0.0,
+                                Direction::Left => largest_ctr.end_x >= cropped_width,
+                            };
+
+                            if gap_at_start {
+                                let new_end_of_roll = match FILM_MOVE_DIR {
+                                    Direction::Right => {
+                                        largest_ctr.end_x
+                                            >= cropped_width * END_OF_ROLL_DETECTION_POS
+                                    }
+                                    Direction::Left => {
+                                        largest_ctr.start_x
+                                            <= cropped_width * END_OF_ROLL_DETECTION_POS
+                                    }
+                                };
+
+                                if new_end_of_roll {
+                                    // Only set end_of_roll when it's detected for the first time
+                                    if !end_of_roll {
+                                        scanner.stop(true);
+                                        debug!("End of roll detected");
+                                        audio.play_sound("end_of_roll.wav");
+                                        state.set(ScannerState::AligningFrame {
+                                            wait_until,
+                                            last_seen_dist,
+                                            end_of_roll: true,
+                                        });
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Could not find frame gaps, assume frame is
                         // aligned and take photo
 
                         info!("No frame gaps in feed, stopping motor and taking photo");
                         scanner.stop(true);
-                        let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
-                            + Duration::from_millis(PRE_SHUTTER_WAIT_MSEC)
-                            + Duration::from_millis(STEPPER_ACCEL_TIME);
+                        // let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
+                        //     + Duration::from_millis(PRE_SHUTTER_WAIT_MSEC)
+                        //     + Duration::from_millis(STEPPER_ACCEL_TIME);
 
                         state.set(ScannerState::TakingPhoto {
-                            wait_until: Instant::now() + wait_time,
+                            wait_until: Instant::now(), // + wait_time,
                         })
                     }
                 }
@@ -721,8 +927,13 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                scanner.take_photo();
-                scanner.stop_focus();
+                audio.play_sound("shutter.wav");
+                if DRY_RUN {
+                    info!("DRY_RUN enabled: would take photo");
+                } else {
+                    scanner.take_photo();
+                    scanner.stop_focus();
+                }
 
                 state.set(ScannerState::WaitingForShutterClose);
             }
@@ -733,7 +944,7 @@ fn main() -> Result<()> {
                 // shutter black-out)
                 let non_zero_px = core::count_non_zero(&frame_bw)?;
                 // TODO: magic numbers
-                if non_zero_px <= 2000 {
+                if non_zero_px <= 2000 || DRY_RUN {
                     state.set(ScannerState::WaitingForShutterOpen);
                 } else {
                     info!("Waiting for start of shutter black-out")
@@ -748,6 +959,9 @@ fn main() -> Result<()> {
                 // TODO: magic numbers
                 if non_zero_px > 2000 {
                     info!("Moving film to next frame");
+
+                    scanner.focus();
+                    scanner.stop_focus();
 
                     // Move enough forward so that we start detecting the next frame
                     match FILM_MOVE_DIR {
@@ -764,6 +978,7 @@ fn main() -> Result<()> {
 
                     let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
                         + Duration::from_millis(STEPPER_ACCEL_TIME)
+                        + Duration::from_millis(PRE_DETECTION_WAIT_MSEC)
                         + Duration::from_millis(step_time as u64);
 
                     state.set(ScannerState::SkipToNextFrame {

@@ -12,5 +12,6 @@ debug = 0
 [dependencies]
 env_logger = "0.9.0"
 log = "0.4.17"
-opencv = "0.63.1"
+opencv = { version = "0.63.1", features = ["clang-runtime"] }
+rodio = "0.15.0"
 serialport = "4.0.1"
