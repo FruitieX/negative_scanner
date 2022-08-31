@@ -43,7 +43,7 @@ const SLOP_STEPS: usize = 20;
 
 /// Always step this many extra steps when aligning frame, tries to ensure
 /// that the leading edge of the frame never ends up visible.
-const EXTRA_ALIGNMENT_STEPS: usize = 10;
+const EXTRA_ALIGNMENT_STEPS: usize = 15;
 
 /// Extra time to wait before running detection after a move command. Helps
 /// avoid motion blur, and gives camera some time to adjust auto exposure.
@@ -63,7 +63,7 @@ const MSEC_PER_1000_STEPS: u64 = 400;
 const STEPPER_ACCEL_TIME: u64 = 0;
 
 /// How many steps to move the film forward after taking a photo.
-const NEXT_FRAME_SKIP_STEPS: usize = 985;
+const NEXT_FRAME_SKIP_STEPS: usize = 984;
 
 /// Slow film down for easier feeding when frame moves past this point (in
 /// percentage of width). Film is slowed down until DETECTION_POS
@@ -85,15 +85,24 @@ struct State {
 }
 
 #[derive(Debug, PartialEq)]
+enum ErrorReason {
+    EndOfRoll,
+    SuspiciousStartGap,
+}
+
+#[derive(Debug, PartialEq)]
 enum ScannerState {
     TogglingFocus {
         init_timestamp: Instant,
         step: usize,
     },
+    Error {
+        init_timestamp: Instant,
+        reason: ErrorReason,
+    },
     AligningFrame {
         wait_until: Instant,
         last_seen_dist: Option<f64>,
-        end_of_roll: bool,
     },
     TakingPhoto {
         wait_until: Instant,
@@ -110,7 +119,6 @@ impl Default for ScannerState {
         ScannerState::AligningFrame {
             wait_until: Instant::now(),
             last_seen_dist: None,
-            end_of_roll: false,
         }
     }
 }
@@ -245,6 +253,8 @@ struct ColStats {
     col_mean: Mat,
     col_std_dev: Mat,
     col_diffs: Mat,
+    col_mins: Mat,
+    col_maxs: Mat,
 }
 
 /// Computes mean values, standard deviation, min and max pixel values within
@@ -256,6 +266,8 @@ fn get_col_stats(mat: &Mat) -> Result<ColStats> {
     let mut col_mean = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
     let mut col_std_dev = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
     let mut col_diffs = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
+    let mut col_mins = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
+    let mut col_maxs = unsafe { Mat::new_nd(1, &mat.cols(), opencv::core::CV_64F)? };
 
     let mut mat_bw = Mat::default();
     imgproc::cvt_color(&mat, &mut mat_bw, imgproc::COLOR_RGB2GRAY, 0)?;
@@ -300,6 +312,12 @@ fn get_col_stats(mat: &Mat) -> Result<ColStats> {
 
             let col_diff: &mut f64 = col_diffs.at_mut(i)?;
             *col_diff = (max_val.unwrap() - min_val.unwrap()) / 255.0;
+
+            let col_mins: &mut f64 = col_mins.at_mut(i)?;
+            *col_mins = min_val.unwrap() / 255.0;
+
+            let col_maxs: &mut f64 = col_maxs.at_mut(i)?;
+            *col_maxs = max_val.unwrap() / 255.0;
         }
     }
 
@@ -307,6 +325,8 @@ fn get_col_stats(mat: &Mat) -> Result<ColStats> {
         col_mean,
         col_std_dev,
         col_diffs,
+        col_mins,
+        col_maxs,
     })
 }
 
@@ -402,6 +422,8 @@ fn main() -> Result<()> {
 
     let mut state = State::new();
 
+    let mut diff_avg = 0.00;
+
     loop {
         // Capture next frame
         cam.read(&mut frame)?;
@@ -433,7 +455,8 @@ fn main() -> Result<()> {
             col_mean,
             col_std_dev,
             col_diffs,
-            ..
+            col_mins,
+            col_maxs,
         } = get_col_stats(&frame_blurred)?;
 
         // dbg!(format!(
@@ -452,16 +475,43 @@ fn main() -> Result<()> {
             dbg_col(&col_std_dev, "col_std_dev")?;
             dbg_col(&col_mean, "col_mean")?;
             dbg_col(&col_diffs, "col_diffs")?;
+            dbg_col(&col_maxs, "col_maxs")?;
+            dbg_col(&col_mins, "col_mins")?;
         }
 
         // Find darkest and brightest column mean values
         // TODO: should maybe use col_mins and col_maxs?
-        let (_col_mean_darkest, col_mean_brightest) = {
+        // let (_col_mean_darkest, col_mean_brightest) = {
+        //     let mut min_val = Some(0.0);
+        //     let mut max_val = Some(0.0);
+        //     min_max_loc(
+        //         &col_mean,
+        //         min_val.as_mut(),
+        //         max_val.as_mut(),
+        //         None,
+        //         None,
+        //         &Mat::default(),
+        //     )?;
+
+        //     (min_val.unwrap(), max_val.unwrap())
+        // };
+        // dbg!(col_mean_brightest, col_mean_darkest);
+
+        let (col_min, col_max) = {
             let mut min_val = Some(0.0);
             let mut max_val = Some(0.0);
             min_max_loc(
-                &col_mean,
+                &col_mins,
                 min_val.as_mut(),
+                None,
+                None,
+                None,
+                &Mat::default(),
+            )?;
+
+            min_max_loc(
+                &col_maxs,
+                None,
                 max_val.as_mut(),
                 None,
                 None,
@@ -470,46 +520,51 @@ fn main() -> Result<()> {
 
             (min_val.unwrap(), max_val.unwrap())
         };
-        // dbg!(col_mean_brightest, col_mean_darkest);
 
-        let col_mean_thr_val = col_mean_brightest * 0.8;
-        let col_mean_thr_val = col_mean_thr_val * 255.0;
+        let new_diff_avg = col_max - col_min;
+        let factor = 0.95;
+        diff_avg = factor * diff_avg + (1.0 - factor) * new_diff_avg;
+        trace!("diff_avg: {:.2}", diff_avg);
 
-        let mut col_mean_thr = Mat::default();
-        col_mean.convert_to(&mut col_mean_thr, core::CV_8U, 255.0, 0.0)?;
+        let col_min_thr_val = col_max * 0.7;
+
+        let mut col_min_thr = Mat::default();
+        col_mins.convert_to(&mut col_min_thr, core::CV_8U, 255.0, 0.0)?;
         imgproc::threshold(
-            &col_mean_thr.clone(),
-            &mut col_mean_thr,
-            col_mean_thr_val,
+            &col_min_thr.clone(),
+            &mut col_min_thr,
+            col_min_thr_val * 255.0,
             255.0,
             imgproc::THRESH_BINARY,
         )?;
-        dbg_col(&col_mean_thr, "col_mean_thr")?;
+        dbg_col(&col_min_thr, "col_min_thr")?;
 
+        let col_std_dev_thr_val = 0.075;
         let mut col_std_dev_thr = Mat::default();
         col_std_dev.convert_to(&mut col_std_dev_thr, core::CV_8U, 255.0, 0.0)?;
         imgproc::threshold(
             &col_std_dev_thr.clone(),
             &mut col_std_dev_thr,
-            20.0,
+            col_std_dev_thr_val * 255.0,
             255.0,
             imgproc::THRESH_BINARY_INV,
         )?;
         dbg_col(&col_std_dev_thr, "col_std_dev_thr")?;
 
+        let col_diffs_thr_val = 0.25;
         let mut col_diffs_thr = Mat::default();
         col_diffs.convert_to(&mut col_diffs_thr, core::CV_8U, 255.0, 0.0)?;
         imgproc::threshold(
             &col_diffs_thr.clone(),
             &mut col_diffs_thr,
-            50.0,
+            col_diffs_thr_val * 255.0,
             255.0,
             imgproc::THRESH_BINARY_INV,
         )?;
         dbg_col(&col_diffs_thr, "col_diffs_thr")?;
 
         let mut mask = Mat::default();
-        core::bitwise_and(&col_mean_thr, &col_std_dev_thr, &mut mask, &Mat::default())?;
+        core::bitwise_and(&col_min_thr, &col_std_dev_thr, &mut mask, &Mat::default())?;
         core::bitwise_and(&mask.clone(), &col_diffs_thr, &mut mask, &Mat::default())?;
         dbg_col(&mask, "mask")?;
 
@@ -581,16 +636,20 @@ fn main() -> Result<()> {
         )?;
 
         ctrs.sort_by(|a, b| a.area.partial_cmp(&b.area).unwrap());
-        let largest_ctr = ctrs.iter().last().cloned();
+        let _largest_ctr = ctrs.iter().last().cloned();
 
         ctrs.sort_by(|a, b| a.end_x.partial_cmp(&b.end_x).unwrap());
-        let next_ctr = match FILM_MOVE_DIR {
+        let last_ctr = match FILM_MOVE_DIR {
+            Direction::Right => ctrs.first(),
+            Direction::Left => ctrs.last(),
+        };
+        let first_ctr = match FILM_MOVE_DIR {
             Direction::Right => ctrs.last(),
             Direction::Left => ctrs.first(),
         };
 
         let edge_ctr = match FILM_MOVE_DIR {
-            Direction::Right => next_ctr.map(|ctr| {
+            Direction::Right => first_ctr.map(|ctr| {
                 if ctr.end_x >= cropped_width {
                     Some(ctr)
                 } else {
@@ -598,7 +657,7 @@ fn main() -> Result<()> {
                 }
             }),
             Direction::Left => {
-                next_ctr.map(|ctr| if ctr.start_x <= 0.0 { Some(ctr) } else { None })
+                first_ctr.map(|ctr| if ctr.start_x <= 0.0 { Some(ctr) } else { None })
             }
         }
         .flatten();
@@ -610,7 +669,7 @@ fn main() -> Result<()> {
         highgui::imshow("frame", &frame_inv)?;
 
         // How many pixels film still needs to move according to detection
-        let dist_to_next_gap_end = match (next_ctr, FILM_MOVE_DIR) {
+        let dist_to_next_gap_end = match (first_ctr, FILM_MOVE_DIR) {
             (Some(next_ctr), Direction::Right) => Some(cropped_width - next_ctr.start_x),
             (Some(next_ctr), Direction::Left) => Some(next_ctr.end_x),
             _ => None,
@@ -751,7 +810,45 @@ fn main() -> Result<()> {
             continue;
         }
 
+        // Whether last ctr is at start of frame
+        let gap_at_start = if let Some(last_ctr) = last_ctr {
+            match FILM_MOVE_DIR {
+                Direction::Right => last_ctr.start_x <= 0.0,
+                Direction::Left => last_ctr.end_x >= cropped_width,
+            }
+        } else {
+            false
+        };
+
+        let end_of_roll = if let Some(last_ctr) = last_ctr {
+            if gap_at_start {
+                match FILM_MOVE_DIR {
+                    Direction::Right => last_ctr.end_x >= cropped_width * END_OF_ROLL_DETECTION_POS,
+                    Direction::Left => {
+                        last_ctr.start_x <= cropped_width * END_OF_ROLL_DETECTION_POS
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         match state.current {
+            ScannerState::Error {
+                ref reason,
+                ..
+            } => match reason {
+                ErrorReason::EndOfRoll => {
+                    if !end_of_roll {
+                        state.set(ScannerState::default());
+                    }
+                }
+                ErrorReason::SuspiciousStartGap => {
+                    pause = true;
+                }
+            },
             ScannerState::TogglingFocus {
                 init_timestamp,
                 step,
@@ -785,7 +882,6 @@ fn main() -> Result<()> {
             ScannerState::AligningFrame {
                 wait_until,
                 last_seen_dist,
-                end_of_roll,
             } => {
                 match dist_to_edge_gap_end {
                     Some(dist_to_edge_gap_end) => {
@@ -810,7 +906,6 @@ fn main() -> Result<()> {
                                         + Duration::from_millis(PRE_FEED_NEW_FILM_WAIT)
                                         + Duration::from_millis(STEPPER_ACCEL_TIME),
                                     last_seen_dist: Some(dist_to_edge_gap_end),
-                                    end_of_roll: false,
                                 });
 
                                 continue;
@@ -862,7 +957,6 @@ fn main() -> Result<()> {
                         state.set(ScannerState::AligningFrame {
                             wait_until: Instant::now() + wait_time,
                             last_seen_dist: Some(dist_to_edge_gap_end),
-                            end_of_roll: false,
                         })
                     }
                     None => {
@@ -871,46 +965,36 @@ fn main() -> Result<()> {
                             continue;
                         }
 
-                        if let Some(largest_ctr) = largest_ctr {
-                            let gap_at_start = match FILM_MOVE_DIR {
-                                Direction::Right => largest_ctr.start_x <= 0.0,
-                                Direction::Left => largest_ctr.end_x >= cropped_width,
-                            };
+                        if end_of_roll {
+                            scanner.stop(true);
+                            debug!("End of roll detected");
+                            audio.play_sound("end_of_roll.wav");
 
-                            if gap_at_start {
-                                let new_end_of_roll = match FILM_MOVE_DIR {
-                                    Direction::Right => {
-                                        largest_ctr.end_x
-                                            >= cropped_width * END_OF_ROLL_DETECTION_POS
-                                    }
-                                    Direction::Left => {
-                                        largest_ctr.start_x
-                                            <= cropped_width * END_OF_ROLL_DETECTION_POS
-                                    }
-                                };
+                            state.set(ScannerState::Error {
+                                init_timestamp: Instant::now(),
+                                reason: ErrorReason::EndOfRoll,
+                            });
+                            continue;
+                        }
+                        if gap_at_start {
+                            scanner.stop(true);
+                            debug!(
+                                "Suspicious gap at start of frame, stopping for manual controls"
+                            );
+                            audio.play_sound("end_of_roll.wav");
 
-                                if new_end_of_roll {
-                                    // Only set end_of_roll when it's detected for the first time
-                                    if !end_of_roll {
-                                        scanner.stop(true);
-                                        debug!("End of roll detected");
-                                        audio.play_sound("end_of_roll.wav");
-                                        state.set(ScannerState::AligningFrame {
-                                            wait_until,
-                                            last_seen_dist,
-                                            end_of_roll: true,
-                                        });
-                                    }
-                                    continue;
-                                }
-                            }
+                            state.set(ScannerState::Error {
+                                init_timestamp: Instant::now(),
+                                reason: ErrorReason::SuspiciousStartGap,
+                            });
+                            continue;
                         }
 
                         // Could not find frame gaps, assume frame is
                         // aligned and take photo
 
-                        info!("No frame gaps in feed, stopping motor and taking photo");
-                        scanner.stop(true);
+                        info!("No frame gaps in feed, taking photo");
+                        // scanner.stop(true);
                         // let wait_time = Duration::from_millis(INPUT_LAG_MSEC)
                         //     + Duration::from_millis(PRE_SHUTTER_WAIT_MSEC)
                         //     + Duration::from_millis(STEPPER_ACCEL_TIME);
