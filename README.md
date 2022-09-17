@@ -1,5 +1,9 @@
 # negative_scanner
 
+- YouTube video: https://www.youtube.com/watch?v=Sj7jFEvvFl8
+- "Blog" post, short writeup with pictures of prototypes: https://github.com/FruitieX/negative_scanner/blob/main/blog.md
+- 3D printed parts and another writeup: https://www.printables.com/model/244900-modular-print-in-place-35mm-film-scanner
+
 This project consists of a Rust program and Arduino sketch that helps scan 35mm
 film negatives using a DSLR camera and a motorized negative feeder.
 
