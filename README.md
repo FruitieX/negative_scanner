@@ -1,5 +1,7 @@
 # negative_scanner
 
+![image](https://user-images.githubusercontent.com/3673134/190869457-ed3df17c-5dbd-4a8e-b5e1-04e92d06c93c.png)
+
 - YouTube video: https://www.youtube.com/watch?v=Sj7jFEvvFl8
 - "Blog" post, short writeup with pictures of prototypes: https://github.com/FruitieX/negative_scanner/blob/main/blog.md
 - 3D printed parts and another writeup: https://www.printables.com/model/244900-modular-print-in-place-35mm-film-scanner
