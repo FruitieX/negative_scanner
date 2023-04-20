@@ -1,6 +1,6 @@
 # negative_scanner
 
-![image](https://user-images.githubusercontent.com/3673134/190869457-ed3df17c-5dbd-4a8e-b5e1-04e92d06c93c.png)
+![image](https://user-images.githubusercontent.com/3673134/233270537-ee8bb01a-56ac-459e-8fd4-ad0e522cfc32.png)
 
 - YouTube video: https://www.youtube.com/watch?v=Sj7jFEvvFl8
 - "Blog" post, short writeup with pictures of prototypes: https://github.com/FruitieX/negative_scanner/blob/main/blog.md
